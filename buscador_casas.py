@@ -747,32 +747,68 @@ class Fotocasa(PortalInmobiliario):
                 if pagina >= filtros.paginas_max:
                     break
 
-                # Click en "Siguiente"
-                siguiente = None
+                # Debug: mostrar qué hay en la zona de paginación
+                pag_info = page.evaluate("""() => {
+                    const nav = document.querySelector('nav, [class*="aginat"], [class*="ager"]');
+                    const links = document.querySelectorAll('a[href*="currentPage"], a[href*="/l/"], [class*="aginat"] a, nav a');
+                    const buttons = document.querySelectorAll('[class*="aginat"] button, nav button');
+                    return {
+                        nav_html: nav ? nav.outerHTML.substring(0, 500) : 'NO NAV FOUND',
+                        links: Array.from(links).slice(0, 10).map(a => ({text: a.textContent.trim(), href: a.href, classes: a.className})),
+                        buttons: Array.from(buttons).slice(0, 5).map(b => ({text: b.textContent.trim(), classes: b.className})),
+                        all_navs: Array.from(document.querySelectorAll('nav')).map(n => n.className),
+                    };
+                }""")
+                print(f"  [{self.NOMBRE}]   Debug paginación: {json.dumps(pag_info, ensure_ascii=False, indent=2)[:600]}")
+
+                # Intentar click por número de página
+                pagina_siguiente = pagina + 1
+                clicked = False
+
+                # Método 1: buscar link con el número de página
                 for sel in [
-                    "a[aria-label='Siguiente']",
-                    "li.sui-MoleculePagination-item--next a",
-                    "a[rel='next']",
-                    "button:has-text('Siguiente')",
-                    "a:has-text('Siguiente')",
+                    f"a:has-text('{pagina_siguiente}')",
+                    f"[class*='aginat'] a:has-text('{pagina_siguiente}')",
+                    f"nav a:has-text('{pagina_siguiente}')",
+                    f"button:has-text('{pagina_siguiente}')",
                 ]:
                     try:
                         el = page.locator(sel).first
-                        if el.is_visible(timeout=2000):
-                            siguiente = el
+                        if el.is_visible(timeout=1500):
+                            el.click()
+                            clicked = True
                             break
                     except Exception:
                         continue
 
-                if not siguiente:
-                    print(f"  [{self.NOMBRE}]   No se encontró botón 'Siguiente', parando.")
+                # Método 2: buscar "Siguiente" / "Next" / ">"
+                if not clicked:
+                    for sel in [
+                        "a[aria-label*='iguiente']",
+                        "a[aria-label*='ext']",
+                        "li.sui-MoleculePagination-item--next a",
+                        "[class*='next'] a",
+                        "[class*='Next'] a",
+                        "a[rel='next']",
+                        "a:has-text('Siguiente')",
+                        "a:has-text('>')",
+                        "button:has-text('Siguiente')",
+                        "button:has-text('>')",
+                    ]:
+                        try:
+                            el = page.locator(sel).first
+                            if el.is_visible(timeout=1500):
+                                el.click()
+                                clicked = True
+                                break
+                        except Exception:
+                            continue
+
+                if not clicked:
+                    print(f"  [{self.NOMBRE}]   No se encontró paginación, parando.")
                     break
 
-                siguiente.click()
-                page.wait_for_timeout(2000)
-                # Scroll arriba para la nueva página
-                page.evaluate("window.scrollTo(0, 0)")
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(3000)
 
         except Exception as e:
             print(f"  [{self.NOMBRE}] Error browser: {e}")
@@ -784,23 +820,37 @@ class Fotocasa(PortalInmobiliario):
     def _parse_html_browser(self, soup: BeautifulSoup) -> list[Vivienda]:
         """Parseo HTML tras renderizado completo con browser — extrae campos limpios."""
         resultados = []
+        urls_vistas = set()
         items = soup.select("article")
 
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
 
-            # URL — enlace al detalle del piso
-            link = item.select_one("a[href*='/es/alquiler/vivienda/'], a[href*='/es/compra/vivienda/']")
+            # URL — buscar cualquier enlace a detalle de vivienda
+            link = None
+            for a in item.select("a[href]"):
+                href = a.get("href", "")
+                if "/vivienda/" in href or "/inmueble/" in href or re.search(r'/\d{6,}/', href):
+                    link = a
+                    break
             if not link:
-                link = item.select_one("a[href*='/es/']")
+                link = item.select_one("a[href]")
             if link:
                 href = link.get("href", "")
                 v.url = href if href.startswith("http") else self.BASE + href
+                # Evitar duplicados
+                if v.url in urls_vistas:
+                    continue
+                urls_vistas.add(v.url)
 
-            # Extraer todo el texto del artículo para parsing
+            # Extraer todo el texto del artículo
             full_text = item.get_text(" ", strip=True)
 
-            # Precio — buscar patrón X.XXX €/mes o X.XXX €
+            # Descartar articles sin contenido útil (nav, ads, etc.)
+            if len(full_text) < 20 or "€" not in full_text:
+                continue
+
+            # Precio
             m = re.search(r'([\d.,]+\s*€(?:/mes)?)', full_text)
             if m:
                 v.precio = m.group(1)
@@ -815,20 +865,23 @@ class Fotocasa(PortalInmobiliario):
             if m:
                 v.metros = f"{m.group(1)} m²"
 
-            # Título — tipo de vivienda + ubicación desde el texto
-            # Patterns: "Piso con ...", "Estudio en ...", "Ático con ..."
-            m = re.search(r'((?:Piso|Estudio|Ático|Apartamento|Dúplex|Casa|Chalet|Loft)\w*(?:con\s+\w+)?\s*en\s+[^·€]+)', full_text)
+            # Título — tipo de vivienda
+            m = re.search(r'((?:Piso|Estudio|Ático|Apartamento|Dúplex|Casa|Chalet|Loft)\S*(?:\s+con\s+\S+)?(?:\s+en\s+[^·€\d]{3,40})?)', full_text)
             if m:
                 v.titulo = m.group(1).strip()[:80]
             elif link and link.get("title"):
                 v.titulo = link["title"][:80]
 
-            # Ubicación — buscar "en ZONA, Barrio" o similar
-            m = re.search(r'en\s+([^·€]{5,50}?,\s*[^·€]{3,30})', full_text)
+            # Ubicación
+            m = re.search(r'en\s+([^·€\d]{3,40}?,\s*[^·€\d]{3,30})', full_text)
             if m:
                 v.ubicacion = m.group(1).strip()
+            else:
+                m = re.search(r'(?:en|,)\s+(\S+(?:\s+\S+){0,3})\s+Madrid', full_text)
+                if m:
+                    v.ubicacion = m.group(1).strip() + ", Madrid"
 
-            if v.precio or v.url:
+            if v.precio:
                 resultados.append(v)
 
         return resultados

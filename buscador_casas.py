@@ -2,27 +2,49 @@
 """
 buscador_casas.py — Buscador unificado de viviendas en portales inmobiliarios españoles.
 
-Busca en Idealista, Fotocasa, Tecnocasa y Redpiso con filtros comunes.
+Busca en Idealista (API oficial o scraping), Fotocasa (parseo __NEXT_DATA__),
+Tecnocasa y Redpiso con filtros comunes.
+
+Configuración:
+  Variables de entorno o archivo .env:
+    IDEALISTA_API_KEY    — API key de Idealista (developers.idealista.com)
+    IDEALISTA_API_SECRET — API secret de Idealista
 """
 
 import argparse
+import base64
 import json
+import os
 import re
 import sys
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
-from urllib.parse import urlencode, quote
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 from bs4 import BeautifulSoup
+
+# ─── Cargar .env si existe ───
+
+def load_dotenv():
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+load_dotenv()
 
 # ─── Modelos ───
 
 @dataclass
 class Filtros:
-    operacion: str = "venta"         # venta | alquiler
-    ubicacion: str = "madrid"        # ciudad o zona
+    operacion: str = "venta"
+    ubicacion: str = "madrid"
     precio_min: int = 0
     precio_max: int = 0
     habitaciones_min: int = 0
@@ -43,79 +65,179 @@ class Vivienda:
     descripcion: str = ""
 
 
-# ─── Clase base para portales ───
+# ─── Clase base ───
 
 class PortalInmobiliario(ABC):
     NOMBRE = ""
     HEADERS = {
         "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
     }
 
-    def _get(self, url, headers=None, params=None):
-        """GET con reintentos y manejo de errores."""
+    def _get(self, url, headers=None, params=None, allow_redirects=True):
         h = {**self.HEADERS, **(headers or {})}
         for intento in range(3):
             try:
-                resp = requests.get(url, headers=h, params=params, timeout=15)
+                resp = requests.get(url, headers=h, params=params,
+                                    timeout=15, allow_redirects=allow_redirects)
                 if resp.status_code == 200:
                     return resp
                 if resp.status_code == 403:
-                    print(f"  [{self.NOMBRE}] Acceso bloqueado (403). El portal puede estar rechazando la conexión.")
+                    print(f"  [{self.NOMBRE}] Bloqueado (403). Puede requerir API key o el portal rechaza scraping.")
                     return None
                 if resp.status_code == 429:
                     wait = 2 ** (intento + 1)
                     print(f"  [{self.NOMBRE}] Rate limit, esperando {wait}s...")
                     time.sleep(wait)
                     continue
+                if resp.status_code in (301, 302):
+                    print(f"  [{self.NOMBRE}] Redireccion a: {resp.headers.get('Location', '?')}")
+                    return None
                 print(f"  [{self.NOMBRE}] HTTP {resp.status_code}")
                 return None
             except requests.RequestException as e:
-                print(f"  [{self.NOMBRE}] Error de conexión: {e}")
+                print(f"  [{self.NOMBRE}] Error: {e}")
                 if intento < 2:
                     time.sleep(2)
         return None
+
+    def _post(self, url, headers=None, data=None, json_data=None):
+        h = {**self.HEADERS, **(headers or {})}
+        try:
+            resp = requests.post(url, headers=h, data=data, json=json_data, timeout=15)
+            if resp.status_code == 200:
+                return resp
+            print(f"  [{self.NOMBRE}] POST HTTP {resp.status_code}")
+            return None
+        except requests.RequestException as e:
+            print(f"  [{self.NOMBRE}] Error POST: {e}")
+            return None
 
     @abstractmethod
     def buscar(self, filtros: Filtros) -> list[Vivienda]:
         pass
 
 
-# ─── Idealista ───
+# ─── Idealista (API oficial OAuth2 + fallback scraping) ───
 
 class Idealista(PortalInmobiliario):
     NOMBRE = "Idealista"
     BASE = "https://www.idealista.com"
+    API_BASE = "https://api.idealista.com"
 
     UBICACIONES = {
-        "madrid": "madrid-madrid",
-        "barcelona": "barcelona-barcelona",
-        "valencia": "valencia-valencia",
-        "sevilla": "sevilla-sevilla",
-        "malaga": "malaga-malaga",
-        "zaragoza": "zaragoza-zaragoza",
-        "bilbao": "bilbao-vizcaya",
-        "alicante": "alicante-alicante",
-        "cordoba": "cordoba-cordoba",
-        "granada": "granada-granada",
-        "murcia": "murcia-murcia",
-        "palma": "palma-de-mallorca-balears-illes",
-        "las palmas": "las-palmas-de-gran-canaria",
-        "valladolid": "valladolid-valladolid",
-        "vigo": "vigo-pontevedra",
-        "gijon": "gijon-asturias",
-        "hospitalet": "l-hospitalet-de-llobregat-barcelona",
-        "vitoria": "vitoria-gasteiz-alava",
-        "santander": "santander-cantabria",
-        "pamplona": "pamplona-navarra",
+        "madrid": ("madrid-madrid", "0-EU-ES-28-07-001-079.html"),
+        "barcelona": ("barcelona-barcelona", "0-EU-ES-08-07-001-019.html"),
+        "valencia": ("valencia-valencia", "0-EU-ES-46-07-001-250.html"),
+        "sevilla": ("sevilla-sevilla", "0-EU-ES-41-07-001-091.html"),
+        "malaga": ("malaga-malaga", "0-EU-ES-29-07-001-067.html"),
+        "zaragoza": ("zaragoza-zaragoza", "0-EU-ES-50-07-001-297.html"),
+        "bilbao": ("bilbao-vizcaya", "0-EU-ES-48-07-001-020.html"),
+        "alicante": ("alicante-alicante", "0-EU-ES-03-07-001-014.html"),
+        "cordoba": ("cordoba-cordoba", "0-EU-ES-14-07-001-021.html"),
+        "granada": ("granada-granada", "0-EU-ES-18-07-001-087.html"),
+        "murcia": ("murcia-murcia", "0-EU-ES-30-07-001-030.html"),
+        "palma": ("palma-de-mallorca-balears-illes", "0-EU-ES-07-07-001-040.html"),
+        "valladolid": ("valladolid-valladolid", "0-EU-ES-47-07-001-186.html"),
+        "santander": ("santander-cantabria", "0-EU-ES-39-07-001-075.html"),
+        "pamplona": ("pamplona-navarra", "0-EU-ES-31-07-001-201.html"),
     }
 
-    def _build_url(self, filtros: Filtros) -> str:
-        loc = self.UBICACIONES.get(filtros.ubicacion.lower(), f"{filtros.ubicacion}-{filtros.ubicacion}")
+    def _get_api_token(self):
+        api_key = os.environ.get("IDEALISTA_API_KEY", "")
+        api_secret = os.environ.get("IDEALISTA_API_SECRET", "")
+        if not api_key or not api_secret:
+            return None
+
+        credentials = base64.b64encode(f"{api_key}:{api_secret}".encode()).decode()
+        resp = self._post(
+            f"{self.API_BASE}/oauth/token",
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data="grant_type=client_credentials&scope=read",
+        )
+        if resp:
+            token_data = resp.json()
+            return token_data.get("access_token")
+        return None
+
+    def _buscar_api(self, filtros: Filtros, token: str) -> list[Vivienda]:
+        loc_data = self.UBICACIONES.get(filtros.ubicacion.lower())
+        if not loc_data:
+            print(f"  [{self.NOMBRE}] API: ubicación '{filtros.ubicacion}' no mapeada, usando scraping.")
+            return []
+
+        location_id = loc_data[1]
+        operation = "sale" if filtros.operacion == "venta" else "rent"
+
+        params = {
+            "operation": operation,
+            "propertyType": "homes",
+            "locationId": location_id,
+            "maxItems": 50,
+            "numPage": filtros.pagina,
+            "language": "es",
+            "country": "es",
+        }
+        if filtros.precio_min:
+            params["minPrice"] = filtros.precio_min
+        if filtros.precio_max:
+            params["maxPrice"] = filtros.precio_max
+        if filtros.habitaciones_min:
+            params["bedrooms"] = filtros.habitaciones_min
+        if filtros.metros_min:
+            params["minSize"] = filtros.metros_min
+        if filtros.metros_max:
+            params["maxSize"] = filtros.metros_max
+
+        url = f"{self.API_BASE}/3.5/es/search"
+        print(f"  [{self.NOMBRE}] Buscando via API oficial...")
+        resp = self._post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data=urlencode(params),
+        )
+        if not resp:
+            return []
+
+        data = resp.json()
+        resultados = []
+        for elem in data.get("elementList", []):
+            v = Vivienda(
+                portal=self.NOMBRE,
+                titulo=elem.get("suggestedTexts", {}).get("title", elem.get("description", "")[:80]),
+                precio=f"{elem.get('price', '')} €",
+                ubicacion=elem.get("address", ""),
+                habitaciones=str(elem.get("rooms", "")),
+                metros=f"{elem.get('size', '')} m²",
+                url=elem.get("url", ""),
+                descripcion=elem.get("description", "")[:150],
+            )
+            if not v.url.startswith("http"):
+                v.url = self.BASE + "/" + v.url.lstrip("/")
+            resultados.append(v)
+
+        return resultados
+
+    def _buscar_scraping(self, filtros: Filtros) -> list[Vivienda]:
+        loc_data = self.UBICACIONES.get(filtros.ubicacion.lower())
+        loc = loc_data[0] if loc_data else f"{filtros.ubicacion}-{filtros.ubicacion}"
         op = "venta-viviendas" if filtros.operacion == "venta" else "alquiler-viviendas"
         url = f"{self.BASE}/{op}/{loc}/"
 
@@ -134,14 +256,10 @@ class Idealista(PortalInmobiliario):
             params.append(f"maxRooms={filtros.habitaciones_max}")
         if filtros.pagina > 1:
             params.append(f"pagina={filtros.pagina}")
-
         if params:
             url += "?" + "&".join(params)
-        return url
 
-    def buscar(self, filtros: Filtros) -> list[Vivienda]:
-        url = self._build_url(filtros)
-        print(f"  [{self.NOMBRE}] Buscando en: {url}")
+        print(f"  [{self.NOMBRE}] Buscando via scraping: {url}")
         resp = self._get(url)
         if not resp:
             return []
@@ -149,29 +267,45 @@ class Idealista(PortalInmobiliario):
         soup = BeautifulSoup(resp.text, "lxml")
         resultados = []
 
-        # Idealista usa article.item-multimedia-container o divs con class item
-        items = soup.select("article.item-multimedia-container")
+        # Intentar extraer JSON embebido en el HTML (script con datos de listados)
+        for script in soup.select("script"):
+            txt = script.string or ""
+            if "listingCards" in txt or "elementList" in txt:
+                match = re.search(r'\{.*"elementList"\s*:\s*\[.*\].*\}', txt, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group())
+                        for elem in data.get("elementList", []):
+                            v = Vivienda(
+                                portal=self.NOMBRE,
+                                titulo=elem.get("title", ""),
+                                precio=f"{elem.get('price', '')} €",
+                                ubicacion=elem.get("address", ""),
+                                habitaciones=str(elem.get("rooms", "")),
+                                metros=f"{elem.get('size', '')} m²",
+                                url=self.BASE + elem.get("url", ""),
+                                descripcion=elem.get("description", "")[:150],
+                            )
+                            resultados.append(v)
+                        return resultados
+                    except json.JSONDecodeError:
+                        pass
+
+        # Fallback: parsear HTML directamente
+        items = soup.select("article.item-multimedia-container, article[data-adid]")
         if not items:
             items = soup.select("div.item-info-container")
-        if not items:
-            items = soup.select("article[data-adid]")
 
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
-
-            # Titulo y URL
             link = item.select_one("a.item-link")
             if link:
                 v.titulo = link.get_text(strip=True)
                 href = link.get("href", "")
                 v.url = href if href.startswith("http") else self.BASE + href
-
-            # Precio
             precio_el = item.select_one("span.item-price")
             if precio_el:
                 v.precio = precio_el.get_text(strip=True)
-
-            # Detalles (habitaciones, metros)
             detalles = item.select("span.item-detail")
             for d in detalles:
                 txt = d.get_text(strip=True).lower()
@@ -179,24 +313,27 @@ class Idealista(PortalInmobiliario):
                     v.habitaciones = txt
                 elif "m²" in txt or "m2" in txt:
                     v.metros = txt
-
-            # Ubicación
-            ubicacion_el = item.select_one("span.item-detail-char span") or item.select_one(".item-location")
-            if ubicacion_el:
-                v.ubicacion = ubicacion_el.get_text(strip=True)
-
-            # Descripción
             desc_el = item.select_one("p.item-description, div.item-description")
             if desc_el:
                 v.descripcion = desc_el.get_text(strip=True)[:150]
-
             if v.titulo or v.precio:
                 resultados.append(v)
 
         return resultados
 
+    def buscar(self, filtros: Filtros) -> list[Vivienda]:
+        # Intentar API oficial primero
+        token = self._get_api_token()
+        if token:
+            resultados = self._buscar_api(filtros, token)
+            if resultados:
+                return resultados
+            print(f"  [{self.NOMBRE}] API sin resultados, intentando scraping...")
 
-# ─── Fotocasa ───
+        return self._buscar_scraping(filtros)
+
+
+# ─── Fotocasa (parseo de __NEXT_DATA__) ───
 
 class Fotocasa(PortalInmobiliario):
     NOMBRE = "Fotocasa"
@@ -240,10 +377,126 @@ class Fotocasa(PortalInmobiliario):
             params["maxRooms"] = filtros.habitaciones_max
         if filtros.pagina > 1:
             params["currentPage"] = filtros.pagina
-
         if params:
             url += "?" + urlencode(params)
         return url
+
+    def _parse_next_data(self, soup: BeautifulSoup) -> list[Vivienda]:
+        """Extrae datos del JSON __NEXT_DATA__ que Next.js inyecta en el HTML."""
+        script = soup.select_one("script#__NEXT_DATA__")
+        if not script or not script.string:
+            return []
+
+        try:
+            data = json.loads(script.string)
+        except json.JSONDecodeError:
+            return []
+
+        resultados = []
+
+        # Navegar la estructura de Next.js para encontrar listings
+        props = data.get("props", {}).get("pageProps", {})
+
+        # Buscar en varias ubicaciones posibles dentro del JSON
+        listings = []
+        for key in ("initialListings", "listings", "searchResults", "results"):
+            if key in props:
+                val = props[key]
+                if isinstance(val, list):
+                    listings = val
+                elif isinstance(val, dict):
+                    listings = val.get("results", val.get("items", val.get("elements", [])))
+                if listings:
+                    break
+
+        # Buscar recursivamente si no se encontró en el primer nivel
+        if not listings:
+            listings = self._find_listings_recursive(props)
+
+        for item in listings:
+            if not isinstance(item, dict):
+                continue
+            v = Vivienda(portal=self.NOMBRE)
+
+            # Diferentes estructuras posibles
+            v.titulo = (item.get("title", "") or item.get("name", "")
+                       or item.get("description", {}).get("title", "") if isinstance(item.get("description"), dict) else "")
+            if not v.titulo and isinstance(item.get("description"), str):
+                v.titulo = item["description"][:80]
+
+            price = item.get("price", item.get("rawPrice", item.get("priceInfo", {})))
+            if isinstance(price, dict):
+                amount = price.get("amount", price.get("price", price.get("value", "")))
+                v.precio = f"{amount} €" if amount else ""
+            elif price:
+                v.precio = f"{price} €"
+
+            v.habitaciones = str(item.get("rooms", item.get("bedrooms", "")))
+            size = item.get("surface", item.get("size", item.get("area", "")))
+            v.metros = f"{size} m²" if size else ""
+
+            v.ubicacion = item.get("address", item.get("location", item.get("zone", "")))
+            if isinstance(v.ubicacion, dict):
+                v.ubicacion = v.ubicacion.get("description", v.ubicacion.get("name", ""))
+
+            detail_url = item.get("url", item.get("detail", {}).get("url", "") if isinstance(item.get("detail"), dict) else "")
+            if detail_url:
+                v.url = detail_url if detail_url.startswith("http") else self.BASE + detail_url
+
+            desc = item.get("description", "")
+            if isinstance(desc, str):
+                v.descripcion = desc[:150]
+
+            if v.titulo or v.precio:
+                resultados.append(v)
+
+        return resultados
+
+    def _find_listings_recursive(self, obj, depth=0) -> list:
+        """Busca arrays de listings dentro del JSON de forma recursiva."""
+        if depth > 5:
+            return []
+        if isinstance(obj, list) and len(obj) > 0 and isinstance(obj[0], dict):
+            if any(k in obj[0] for k in ("price", "rooms", "surface", "priceInfo", "bedrooms")):
+                return obj
+        if isinstance(obj, dict):
+            for val in obj.values():
+                result = self._find_listings_recursive(val, depth + 1)
+                if result:
+                    return result
+        return []
+
+    def _parse_html(self, soup: BeautifulSoup) -> list[Vivienda]:
+        """Fallback: parseo HTML directo."""
+        resultados = []
+        items = soup.select("article[class*='Card'], article[data-id]")
+        if not items:
+            items = soup.select("section.re-SearchResult article, div[class*='listing']")
+
+        for item in items:
+            v = Vivienda(portal=self.NOMBRE)
+            link = item.select_one("a[href*='/es/']")
+            if not link:
+                link = item.select_one("a[href]")
+            if link:
+                v.titulo = link.get("title", "") or link.get_text(strip=True)
+                href = link.get("href", "")
+                v.url = href if href.startswith("http") else self.BASE + href
+
+            precio_el = item.select_one("[class*='Price'], [class*='price']")
+            if precio_el:
+                v.precio = precio_el.get_text(strip=True)
+
+            for el in item.select("[class*='Feature'], [class*='feature'], li"):
+                txt = el.get_text(strip=True).lower()
+                if "hab" in txt or "dorm" in txt:
+                    v.habitaciones = txt
+                elif "m²" in txt or "m2" in txt:
+                    v.metros = txt
+
+            if v.titulo or v.precio:
+                resultados.append(v)
+        return resultados
 
     def buscar(self, filtros: Filtros) -> list[Vivienda]:
         url = self._build_url(filtros)
@@ -253,45 +506,14 @@ class Fotocasa(PortalInmobiliario):
             return []
 
         soup = BeautifulSoup(resp.text, "lxml")
-        resultados = []
 
-        items = soup.select("article.re-CardPackPremium, article.re-CardPackMinimal, article.re-CardPackAdvance")
-        if not items:
-            items = soup.select("section.re-SearchResult article")
-        if not items:
-            items = soup.select("article[class*='Card']")
+        # Intentar __NEXT_DATA__ primero (datos completos)
+        resultados = self._parse_next_data(soup)
+        if resultados:
+            return resultados
 
-        for item in items:
-            v = Vivienda(portal=self.NOMBRE)
-
-            link = item.select_one("a.re-CardPackPremium-slider, a[class*='Card']")
-            if not link:
-                link = item.select_one("a[href]")
-            if link:
-                v.titulo = link.get("title", "") or link.get_text(strip=True)
-                href = link.get("href", "")
-                v.url = href if href.startswith("http") else self.BASE + href
-
-            precio_el = item.select_one("span.re-CardPrice, span[class*='Price']")
-            if precio_el:
-                v.precio = precio_el.get_text(strip=True)
-
-            features = item.select("li.re-CardFeatures-feature, span[class*='Feature']")
-            for feat in features:
-                txt = feat.get_text(strip=True).lower()
-                if "hab" in txt or "dorm" in txt:
-                    v.habitaciones = txt
-                elif "m²" in txt or "m2" in txt:
-                    v.metros = txt
-
-            ubicacion_el = item.select_one("span[class*='Location'], span[class*='location']")
-            if ubicacion_el:
-                v.ubicacion = ubicacion_el.get_text(strip=True)
-
-            if v.titulo or v.precio:
-                resultados.append(v)
-
-        return resultados
+        # Fallback a HTML
+        return self._parse_html(soup)
 
 
 # ─── Tecnocasa ───
@@ -300,10 +522,26 @@ class Tecnocasa(PortalInmobiliario):
     NOMBRE = "Tecnocasa"
     BASE = "https://www.tecnocasa.es"
 
+    REGIONES = {
+        "madrid": "comunidad-de-madrid/madrid",
+        "barcelona": "cataluna/barcelona/barcelona",
+        "valencia": "comunidad-valenciana/valencia/valencia",
+        "sevilla": "andalucia/sevilla/sevilla",
+        "malaga": "andalucia/malaga/malaga",
+        "zaragoza": "aragon/zaragoza/zaragoza",
+        "bilbao": "pais-vasco/vizcaya/bilbao",
+        "alicante": "comunidad-valenciana/alicante/alicante",
+        "murcia": "region-de-murcia/murcia/murcia",
+        "granada": "andalucia/granada/granada",
+        "cordoba": "andalucia/cordoba/cordoba",
+        "valladolid": "castilla-y-leon/valladolid/valladolid",
+        "santander": "cantabria/cantabria/santander",
+    }
+
     def _build_url(self, filtros: Filtros) -> str:
-        loc = filtros.ubicacion.lower().replace(" ", "-")
+        loc = self.REGIONES.get(filtros.ubicacion.lower(), f"{filtros.ubicacion}/{filtros.ubicacion}")
         op = "venta" if filtros.operacion == "venta" else "alquiler"
-        url = f"{self.BASE}/{op}/pisos/{loc}/{loc}.html"
+        url = f"{self.BASE}/{op}/inmuebles/{loc}.html"
 
         params = {}
         if filtros.precio_min:
@@ -318,7 +556,6 @@ class Tecnocasa(PortalInmobiliario):
             params["habmin"] = filtros.habitaciones_min
         if filtros.pagina > 1:
             params["pagina"] = filtros.pagina
-
         if params:
             url += "?" + urlencode(params)
         return url
@@ -333,38 +570,60 @@ class Tecnocasa(PortalInmobiliario):
         soup = BeautifulSoup(resp.text, "lxml")
         resultados = []
 
-        items = soup.select("div.property-card, article.property, div.listing-item, div[class*='annuncio']")
-        if not items:
-            items = soup.select("div.resultItem, div.item-listing")
+        # Buscar JSON-LD (schema.org) — muchas webs lo incluyen
+        for script in soup.select('script[type="application/ld+json"]'):
+            try:
+                ld = json.loads(script.string or "")
+                items = []
+                if isinstance(ld, list):
+                    items = ld
+                elif isinstance(ld, dict) and ld.get("@type") in ("ItemList", "SearchResultsPage"):
+                    items = ld.get("itemListElement", [])
+                elif isinstance(ld, dict) and ld.get("@type") in ("Apartment", "House", "Residence", "RealEstateListing"):
+                    items = [ld]
 
+                for item in items:
+                    if isinstance(item, dict) and item.get("item"):
+                        item = item["item"]
+                    if not isinstance(item, dict):
+                        continue
+                    v = Vivienda(
+                        portal=self.NOMBRE,
+                        titulo=item.get("name", ""),
+                        precio=item.get("offers", {}).get("price", "") if isinstance(item.get("offers"), dict) else "",
+                        ubicacion=item.get("address", {}).get("streetAddress", "") if isinstance(item.get("address"), dict) else "",
+                        url=item.get("url", ""),
+                        descripcion=(item.get("description", "") or "")[:150],
+                    )
+                    if v.precio:
+                        v.precio = f"{v.precio} €"
+                    if v.titulo or v.precio:
+                        resultados.append(v)
+                if resultados:
+                    return resultados
+            except json.JSONDecodeError:
+                continue
+
+        # Parseo HTML
+        items = soup.select("div[class*='annuncio'], div[class*='property'], div[class*='listing'], article")
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
-
-            link = item.select_one("a[href]")
+            link = item.select_one("a[href*='/venta/'], a[href*='/alquiler/']")
+            if not link:
+                link = item.select_one("a[href]")
             if link:
-                v.titulo = link.get("title", "") or link.get_text(strip=True)
+                v.titulo = link.get("title", "") or link.get_text(strip=True)[:80]
                 href = link.get("href", "")
                 v.url = href if href.startswith("http") else self.BASE + href
 
-            precio_el = item.select_one("span.price, div.price, span[class*='price'], span[class*='precio']")
-            if precio_el:
-                v.precio = precio_el.get_text(strip=True)
-
-            features = item.select("span[class*='feature'], li[class*='feature'], span[class*='detail']")
-            for feat in features:
-                txt = feat.get_text(strip=True).lower()
-                if "hab" in txt or "loc" in txt:
+            for el in item.select("span, div, p"):
+                txt = el.get_text(strip=True)
+                if re.search(r'[\d.,]+\s*€', txt) and not v.precio:
+                    v.precio = txt
+                elif re.search(r'\d+\s*hab', txt, re.I) and not v.habitaciones:
                     v.habitaciones = txt
-                elif "m²" in txt or "m2" in txt or "sup" in txt:
+                elif re.search(r'\d+\s*m[²2]', txt) and not v.metros:
                     v.metros = txt
-
-            ubicacion_el = item.select_one("span[class*='location'], p[class*='address'], span[class*='zona']")
-            if ubicacion_el:
-                v.ubicacion = ubicacion_el.get_text(strip=True)
-
-            desc_el = item.select_one("p[class*='description'], div[class*='description']")
-            if desc_el:
-                v.descripcion = desc_el.get_text(strip=True)[:150]
 
             if v.titulo or v.precio:
                 resultados.append(v)
@@ -380,8 +639,8 @@ class Redpiso(PortalInmobiliario):
 
     def _build_url(self, filtros: Filtros) -> str:
         loc = filtros.ubicacion.lower().replace(" ", "-")
-        op = "venta" if filtros.operacion == "venta" else "alquiler"
-        url = f"{self.BASE}/pisos-{op}/{loc}"
+        op = "venta-viviendas" if filtros.operacion == "venta" else "alquiler-viviendas"
+        url = f"{self.BASE}/{op}/{loc}"
 
         params = {}
         if filtros.precio_min:
@@ -398,7 +657,6 @@ class Redpiso(PortalInmobiliario):
             params["habitaciones_max"] = filtros.habitaciones_max
         if filtros.pagina > 1:
             params["pagina"] = filtros.pagina
-
         if params:
             url += "?" + urlencode(params)
         return url
@@ -413,38 +671,60 @@ class Redpiso(PortalInmobiliario):
         soup = BeautifulSoup(resp.text, "lxml")
         resultados = []
 
-        items = soup.select("div.property-card, article.listing, div.result-item, div[class*='inmueble']")
-        if not items:
-            items = soup.select("div.list-item, div[class*='property']")
+        # JSON-LD
+        for script in soup.select('script[type="application/ld+json"]'):
+            try:
+                ld = json.loads(script.string or "")
+                items = []
+                if isinstance(ld, list):
+                    items = ld
+                elif isinstance(ld, dict) and ld.get("@type") == "ItemList":
+                    items = ld.get("itemListElement", [])
+                elif isinstance(ld, dict) and ld.get("@type") in ("Apartment", "House", "RealEstateListing"):
+                    items = [ld]
 
+                for item in items:
+                    if isinstance(item, dict) and item.get("item"):
+                        item = item["item"]
+                    if not isinstance(item, dict):
+                        continue
+                    v = Vivienda(
+                        portal=self.NOMBRE,
+                        titulo=item.get("name", ""),
+                        precio=item.get("offers", {}).get("price", "") if isinstance(item.get("offers"), dict) else "",
+                        ubicacion=item.get("address", {}).get("streetAddress", "") if isinstance(item.get("address"), dict) else "",
+                        url=item.get("url", ""),
+                        descripcion=(item.get("description", "") or "")[:150],
+                    )
+                    if v.precio:
+                        v.precio = f"{v.precio} €"
+                    if v.titulo or v.precio:
+                        resultados.append(v)
+                if resultados:
+                    return resultados
+            except json.JSONDecodeError:
+                continue
+
+        # HTML parsing
+        items = soup.select("div[class*='property'], div[class*='inmueble'], article, div[class*='listing']")
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
-
-            link = item.select_one("a[href]")
+            link = item.select_one("a[href*='vivienda'], a[href*='piso']")
+            if not link:
+                link = item.select_one("a[href]")
             if link:
-                v.titulo = link.get("title", "") or link.get_text(strip=True)
+                v.titulo = link.get("title", "") or link.get_text(strip=True)[:80]
                 href = link.get("href", "")
                 v.url = href if href.startswith("http") else self.BASE + href
 
-            precio_el = item.select_one("span.price, div.price, span[class*='precio'], span[class*='price']")
-            if precio_el:
-                v.precio = precio_el.get_text(strip=True)
-
-            features = item.select("span[class*='feature'], li[class*='detail'], span[class*='dato']")
-            for feat in features:
-                txt = feat.get_text(strip=True).lower()
-                if "hab" in txt or "dorm" in txt:
+            for el in item.select("span, div, p"):
+                txt = el.get_text(strip=True)
+                if re.search(r'[\d.,]+\s*€', txt) and not v.precio:
+                    v.precio = txt
+                elif re.search(r'\d+\s*hab', txt, re.I) and not v.habitaciones:
                     v.habitaciones = txt
-                elif "m²" in txt or "m2" in txt:
+                elif re.search(r'\d+\s*m[²2]', txt) and not v.metros:
                     v.metros = txt
-
-            ubicacion_el = item.select_one("span[class*='location'], p[class*='direccion'], span[class*='zona']")
-            if ubicacion_el:
-                v.ubicacion = ubicacion_el.get_text(strip=True)
-
-            desc_el = item.select_one("p[class*='description'], p[class*='descripcion']")
-            if desc_el:
-                v.descripcion = desc_el.get_text(strip=True)[:150]
 
             if v.titulo or v.precio:
                 resultados.append(v)
@@ -462,7 +742,6 @@ PORTALES = {
 }
 
 def buscar(filtros: Filtros, portales_activos: list[str] | None = None) -> list[Vivienda]:
-    """Busca en todos los portales (o los seleccionados) y devuelve resultados unificados."""
     if portales_activos is None:
         portales_activos = list(PORTALES.keys())
 
@@ -479,7 +758,7 @@ def buscar(filtros: Filtros, portales_activos: list[str] | None = None) -> list[
             todos.extend(resultados)
         except Exception as e:
             print(f"  [{portal.NOMBRE}] Error: {e}")
-        time.sleep(1)  # Pausa entre portales
+        time.sleep(1)
 
     return todos
 
@@ -487,9 +766,10 @@ def buscar(filtros: Filtros, portales_activos: list[str] | None = None) -> list[
 # ─── Formateo de salida ───
 
 def mostrar_tabla(viviendas: list[Vivienda]):
-    """Muestra los resultados en formato tabla."""
     if not viviendas:
-        print("\n  No se encontraron resultados.\n")
+        print("\n  No se encontraron resultados.")
+        print("  Tip: Idealista requiere API key. Configura IDEALISTA_API_KEY y IDEALISTA_API_SECRET en .env")
+        print("  Solicita acceso en: https://developers.idealista.com/access-request\n")
         return
 
     print(f"\n{'─' * 120}")
@@ -508,7 +788,6 @@ def mostrar_tabla(viviendas: list[Vivienda]):
 
 
 def mostrar_json(viviendas: list[Vivienda]):
-    """Muestra los resultados en formato JSON."""
     data = [asdict(v) for v in viviendas]
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
@@ -526,6 +805,13 @@ Ejemplos:
   %(prog)s -u valencia --hab-min 2 --metros-min 80 --precio-max 200000
   %(prog)s -u sevilla -p idealista,fotocasa --json
   %(prog)s -u malaga --precio-min 100000 --precio-max 300000 --hab-min 3
+
+Configuración API Idealista:
+  Crea un archivo .env junto al script con:
+    IDEALISTA_API_KEY=tu_api_key
+    IDEALISTA_API_SECRET=tu_api_secret
+
+  Solicita acceso en: https://developers.idealista.com/access-request
         """
     )
 

@@ -177,8 +177,34 @@ Madrid, Barcelona, Valencia, Sevilla, Malaga, Zaragoza, Bilbao, Alicante, Cordob
 
 Para otras ciudades, usa el nombre directamente (ej: `-u toledo`) y el script intentara construir la URL automaticamente.
 
+### Configurar API de Idealista (recomendado)
+
+Idealista bloquea el scraping directo. Para obtener resultados fiables, usa su API oficial:
+
+1. Solicita acceso en: https://developers.idealista.com/access-request
+2. Crea un archivo `.env` junto al script:
+
+```env
+IDEALISTA_API_KEY=tu_api_key
+IDEALISTA_API_SECRET=tu_api_secret
+```
+
+3. El script usara la API automaticamente cuando detecte las credenciales.
+
+Sin API key, el script intentara scraping como fallback (puede devolver 403).
+
+### Como funciona cada portal
+
+| Portal | Metodo | Notas |
+|--------|--------|-------|
+| **Idealista** | API oficial OAuth2 + fallback scraping | Requiere API key para mejores resultados |
+| **Fotocasa** | Parseo de `__NEXT_DATA__` (JSON embebido) | Extrae datos del SSR de Next.js |
+| **Tecnocasa** | JSON-LD (schema.org) + parseo HTML | Inventario mas pequeño (solo franquicias) |
+| **Redpiso** | JSON-LD (schema.org) + parseo HTML | Inventario mas pequeño (solo agencia) |
+
 ### Notas
 
 - Los portales pueden bloquear peticiones automatizadas. Si recibes errores 403, espera unos minutos antes de reintentar.
-- Los selectores HTML dependen de la estructura actual de cada web. Si un portal cambia su diseño, puede ser necesario actualizar los selectores.
+- Fotocasa usa Next.js, los datos se extraen del JSON que el servidor inyecta en el HTML.
+- Tecnocasa y Redpiso tienen inventario limitado a sus propias franquicias/agencias.
 - Usa la opcion `--json` para procesar los resultados con otras herramientas (jq, scripts, etc.).

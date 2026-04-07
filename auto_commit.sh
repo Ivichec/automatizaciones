@@ -73,6 +73,143 @@ if [[ -z "$BRANCH" ]]; then
     BRANCH="$(git -C "$REPO_PATH" rev-parse --abbrev-ref HEAD)"
 fi
 
+# ─── Generar mensaje de commit inteligente basado en el diff ───
+generate_commit_msg() {
+    local diff_stat diff_content files_list
+    diff_stat="$(git -C "$REPO_PATH" diff --cached --stat)"
+    diff_content="$(git -C "$REPO_PATH" diff --cached)"
+    files_list="$(git -C "$REPO_PATH" diff --cached --name-status)"
+
+    # Clasificar archivos por tipo de cambio
+    local new_files=() modified_files=() deleted_files=() renamed_files=()
+    while IFS=$'\t' read -r change_type file_name extra; do
+        [[ -z "$change_type" ]] && continue
+        case "$change_type" in
+            A)  new_files+=("$file_name") ;;
+            M)  modified_files+=("$file_name") ;;
+            D)  deleted_files+=("$file_name") ;;
+            R*) renamed_files+=("$file_name -> $extra") ;;
+        esac
+    done <<< "$files_list"
+
+    # --- Detectar tipo de cambio dominante ---
+    local action=""
+    local subject=""
+
+    # Si solo hay archivos nuevos
+    if [[ ${#new_files[@]} -gt 0 && ${#modified_files[@]} -eq 0 && ${#deleted_files[@]} -eq 0 ]]; then
+        action="add"
+    # Si solo hay eliminados
+    elif [[ ${#deleted_files[@]} -gt 0 && ${#new_files[@]} -eq 0 && ${#modified_files[@]} -eq 0 ]]; then
+        action="remove"
+    # Si solo hay renombrados
+    elif [[ ${#renamed_files[@]} -gt 0 && ${#new_files[@]} -eq 0 && ${#modified_files[@]} -eq 0 && ${#deleted_files[@]} -eq 0 ]]; then
+        action="rename"
+    else
+        action="update"
+    fi
+
+    # --- Detectar el contexto según extensiones y contenido ---
+    local all_files=("${new_files[@]}" "${modified_files[@]}" "${deleted_files[@]}")
+    local extensions=()
+    for f in "${all_files[@]}"; do
+        local ext="${f##*.}"
+        [[ "$ext" != "$f" ]] && extensions+=("$ext")
+    done
+    # Deduplicar extensiones
+    local unique_exts
+    unique_exts="$(printf '%s\n' "${extensions[@]}" 2>/dev/null | sort -u | tr '\n' ',' | sed 's/,$//')"
+
+    # --- Detectar patrones específicos en el diff ---
+    local context_hints=()
+
+    # Funciones nuevas/modificadas
+    local func_changes
+    func_changes="$(echo "$diff_content" | grep -E '^\+\s*(function |def |fn |func |public |private |protected |const |let |var |class )' | head -5 || true)"
+    if [[ -n "$func_changes" ]]; then
+        # Extraer nombres de funciones/clases
+        local func_names
+        func_names="$(echo "$func_changes" | sed -E 's/^\+\s*//' | sed -E 's/\{.*//;s/\(.*//;s/[:,=].*//' | awk '{print $NF}' | head -3 | tr '\n' ', ' | sed 's/,$//')"
+        [[ -n "$func_names" ]] && context_hints+=("$func_names")
+    fi
+
+    # Imports/dependencias
+    if echo "$diff_content" | grep -qE '^\+\s*(import |from |require\(|#include )'; then
+        context_hints+=("dependencias")
+    fi
+
+    # Configuración
+    local config_files=0
+    for f in "${all_files[@]}"; do
+        case "$f" in
+            *.json|*.yml|*.yaml|*.toml|*.ini|*.cfg|*.conf|*.env*|Makefile|Dockerfile|*.docker*|*config*)
+                config_files=$((config_files + 1)) ;;
+        esac
+    done
+    [[ $config_files -gt 0 ]] && context_hints+=("config")
+
+    # Tests
+    local test_files=0
+    for f in "${all_files[@]}"; do
+        case "$f" in
+            *test*|*spec*|*__tests__*) test_files=$((test_files + 1)) ;;
+        esac
+    done
+    [[ $test_files -gt 0 ]] && context_hints+=("tests")
+
+    # Docs
+    local doc_files=0
+    for f in "${all_files[@]}"; do
+        case "$f" in
+            *.md|*.rst|*.txt|docs/*|README*|CHANGELOG*) doc_files=$((doc_files + 1)) ;;
+        esac
+    done
+    [[ $doc_files -gt 0 ]] && context_hints+=("docs")
+
+    # Fix patterns
+    if echo "$diff_content" | grep -qiE '^\+.*(fix|bug|error|patch|hotfix|workaround)'; then
+        action="fix"
+    fi
+
+    # Refactor patterns
+    if echo "$diff_content" | grep -qiE '^\+.*(refactor|cleanup|clean up|reorganize|simplify)'; then
+        [[ "$action" != "fix" ]] && action="refactor"
+    fi
+
+    # --- Construir mensaje ---
+    local total_files=$(( ${#new_files[@]} + ${#modified_files[@]} + ${#deleted_files[@]} + ${#renamed_files[@]} ))
+
+    # Descripción de archivos
+    if [[ $total_files -eq 1 ]]; then
+        subject="${all_files[0]:-${renamed_files[0]:-archivo}}"
+    elif [[ $total_files -le 3 ]]; then
+        subject="$(printf '%s\n' "${all_files[@]}" "${renamed_files[@]}" | head -3 | tr '\n' ', ' | sed 's/,$//')"
+    else
+        # Agrupar por directorio común
+        local common_dir
+        common_dir="$(printf '%s\n' "${all_files[@]}" | sed 's|/[^/]*$||' | sort -u | head -1)"
+        if [[ -n "$common_dir" && "$common_dir" != "${all_files[0]}" ]]; then
+            subject="${common_dir}/ (${total_files} archivos)"
+        else
+            subject="${total_files} archivos [${unique_exts}]"
+        fi
+    fi
+
+    # Agregar contexto
+    local context_str=""
+    if [[ ${#context_hints[@]} -gt 0 ]]; then
+        context_str=" ($(IFS=', '; echo "${context_hints[*]}"))"
+    fi
+
+    # Líneas añadidas/eliminadas
+    local insertions deletions
+    insertions="$(echo "$diff_stat" | tail -1 | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)"
+    deletions="$(echo "$diff_stat" | tail -1 | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)"
+    local delta="+${insertions}/-${deletions}"
+
+    echo "${action}: ${subject}${context_str} [${delta}]"
+}
+
 # ─── Función principal: detectar, commitear y pushear ───
 run_cycle() {
     log_info "Revisando repositorio: $REPO_PATH (rama: $BRANCH)"
@@ -124,11 +261,7 @@ run_cycle() {
     # Generar mensaje de commit si no se proporcionó uno
     local msg="$COMMIT_MSG"
     if [[ -z "$msg" ]]; then
-        local timestamp
-        timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-        local files_changed
-        files_changed="$(git -C "$REPO_PATH" diff --cached --name-only | head -5 | tr '\n' ', ' | sed 's/,$//')"
-        msg="auto-commit: ${timestamp} — archivos: ${files_changed}"
+        msg="$(generate_commit_msg)"
     fi
 
     # Commitear

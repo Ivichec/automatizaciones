@@ -26,6 +26,13 @@ from urllib.parse import urlencode
 import requests
 from bs4 import BeautifulSoup
 
+# Playwright es opcional — solo se usa con --browser
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_DISPONIBLE = True
+except ImportError:
+    PLAYWRIGHT_DISPONIBLE = False
+
 # ─── Cargar .env si existe ───
 
 def load_dotenv():
@@ -67,8 +74,53 @@ class Vivienda:
 
 # ─── Clase base ───
 
+# Variable global para compartir la instancia del navegador
+_browser_context = None
+
+def get_browser_page(url, wait_selector=None, wait_seconds=3):
+    """Navega a una URL con Playwright y devuelve el HTML renderizado."""
+    global _browser_context
+    if not PLAYWRIGHT_DISPONIBLE:
+        print("  [!] Playwright no instalado. Ejecuta: pip install playwright && playwright install chromium")
+        return None
+
+    if _browser_context is None:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True)
+        _browser_context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="es-ES",
+            viewport={"width": 1920, "height": 1080},
+        )
+
+    page = _browser_context.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        if wait_selector:
+            try:
+                page.wait_for_selector(wait_selector, timeout=10000)
+            except Exception:
+                pass
+        # Espera extra para que cargue contenido dinámico
+        page.wait_for_timeout(wait_seconds * 1000)
+        # Scroll para triggerear lazy loading
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        page.wait_for_timeout(1500)
+        html = page.content()
+        return html
+    except Exception as e:
+        print(f"  [Browser] Error navegando a {url}: {e}")
+        return None
+    finally:
+        page.close()
+
+
 class PortalInmobiliario(ABC):
     NOMBRE = ""
+    usar_browser = False
     HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -330,7 +382,65 @@ class Idealista(PortalInmobiliario):
                 return resultados
             print(f"  [{self.NOMBRE}] API sin resultados, intentando scraping...")
 
+        # Modo browser si está habilitado
+        if self.usar_browser:
+            return self._buscar_browser(filtros)
+
         return self._buscar_scraping(filtros)
+
+    def _buscar_browser(self, filtros: Filtros) -> list[Vivienda]:
+        loc_data = self.UBICACIONES.get(filtros.ubicacion.lower())
+        loc = loc_data[0] if loc_data else f"{filtros.ubicacion}-{filtros.ubicacion}"
+        op = "venta-viviendas" if filtros.operacion == "venta" else "alquiler-viviendas"
+        url = f"{self.BASE}/{op}/{loc}/"
+
+        params = []
+        if filtros.precio_min:
+            params.append(f"minPrice={filtros.precio_min}")
+        if filtros.precio_max:
+            params.append(f"maxPrice={filtros.precio_max}")
+        if filtros.habitaciones_min:
+            params.append(f"minRooms={filtros.habitaciones_min}")
+        if filtros.metros_min:
+            params.append(f"minSize={filtros.metros_min}")
+        if filtros.pagina > 1:
+            params.append(f"pagina={filtros.pagina}")
+        if params:
+            url += "?" + "&".join(params)
+
+        print(f"  [{self.NOMBRE}] Usando navegador headless: {url}")
+        html = get_browser_page(url, wait_selector="article.item-multimedia-container", wait_seconds=5)
+        if not html:
+            return []
+
+        soup = BeautifulSoup(html, "lxml")
+        resultados = []
+
+        items = soup.select("article.item-multimedia-container, article[data-adid]")
+        for item in items:
+            v = Vivienda(portal=self.NOMBRE)
+            link = item.select_one("a.item-link")
+            if link:
+                v.titulo = link.get_text(strip=True)
+                href = link.get("href", "")
+                v.url = href if href.startswith("http") else self.BASE + href
+            precio_el = item.select_one("span.item-price")
+            if precio_el:
+                v.precio = precio_el.get_text(strip=True)
+            detalles = item.select("span.item-detail")
+            for d in detalles:
+                txt = d.get_text(strip=True).lower()
+                if "hab" in txt:
+                    v.habitaciones = txt
+                elif "m²" in txt or "m2" in txt:
+                    v.metros = txt
+            desc_el = item.select_one("p.item-description, div.item-description")
+            if desc_el:
+                v.descripcion = desc_el.get_text(strip=True)[:150]
+            if v.titulo or v.precio:
+                resultados.append(v)
+
+        return resultados
 
 
 # ─── Fotocasa (parseo de __NEXT_DATA__) ───
@@ -501,19 +611,77 @@ class Fotocasa(PortalInmobiliario):
     def buscar(self, filtros: Filtros) -> list[Vivienda]:
         url = self._build_url(filtros)
         print(f"  [{self.NOMBRE}] Buscando en: {url}")
+
+        # Modo browser: renderiza JavaScript completo
+        if self.usar_browser:
+            print(f"  [{self.NOMBRE}] Usando navegador headless...")
+            html = get_browser_page(url, wait_selector="article", wait_seconds=4)
+            if html:
+                soup = BeautifulSoup(html, "lxml")
+                resultados = self._parse_next_data(soup)
+                if resultados:
+                    return resultados
+                return self._parse_html_browser(soup)
+            return []
+
+        # Modo requests
         resp = self._get(url)
         if not resp:
             return []
 
         soup = BeautifulSoup(resp.text, "lxml")
-
-        # Intentar __NEXT_DATA__ primero (datos completos)
         resultados = self._parse_next_data(soup)
         if resultados:
             return resultados
-
-        # Fallback a HTML
         return self._parse_html(soup)
+
+    def _parse_html_browser(self, soup: BeautifulSoup) -> list[Vivienda]:
+        """Parseo HTML tras renderizado completo con browser."""
+        resultados = []
+
+        # Con browser el DOM completo está disponible — buscar tarjetas de listados
+        items = soup.select("article")
+        for item in items:
+            v = Vivienda(portal=self.NOMBRE)
+
+            # Buscar enlace principal
+            link = item.select_one("a[href*='/es/']")
+            if not link:
+                link = item.select_one("a[href]")
+            if link:
+                href = link.get("href", "")
+                v.url = href if href.startswith("http") else self.BASE + href
+                v.titulo = link.get("title", "") or ""
+
+            # Precio — buscar texto con formato de precio
+            for el in item.select("span, div"):
+                txt = el.get_text(strip=True)
+                if re.search(r'[\d.,]+\s*€/mes|[\d.,]+\s*€', txt) and not v.precio:
+                    v.precio = txt
+                    break
+
+            # Características — habitaciones y metros
+            for el in item.select("span, li, div"):
+                txt = el.get_text(strip=True)
+                if not txt or len(txt) > 30:
+                    continue
+                if re.search(r'\d+\s*habs?\.?', txt, re.I) and not v.habitaciones:
+                    v.habitaciones = txt.strip("·").strip()
+                elif re.search(r'\d+\s*m[²2]', txt) and not v.metros:
+                    v.metros = txt.strip("·").strip()
+
+            # Titulo fallback si está vacío
+            if not v.titulo:
+                for el in item.select("span, div"):
+                    txt = el.get_text(strip=True)
+                    if len(txt) > 20 and "€" not in txt and "hab" not in txt.lower() and "m²" not in txt:
+                        v.titulo = txt[:80]
+                        break
+
+            if v.precio or v.titulo:
+                resultados.append(v)
+
+        return resultados
 
 
 # ─── Tecnocasa ───
@@ -741,9 +909,15 @@ PORTALES = {
     "redpiso": Redpiso,
 }
 
-def buscar(filtros: Filtros, portales_activos: list[str] | None = None) -> list[Vivienda]:
+def buscar(filtros: Filtros, portales_activos: list[str] | None = None, usar_browser: bool = False) -> list[Vivienda]:
     if portales_activos is None:
         portales_activos = list(PORTALES.keys())
+
+    if usar_browser and not PLAYWRIGHT_DISPONIBLE:
+        print("  [!] Playwright no instalado. Instálalo con:")
+        print("      pip install playwright && playwright install chromium")
+        print("  [!] Continuando sin modo browser...\n")
+        usar_browser = False
 
     todos = []
     for nombre in portales_activos:
@@ -752,6 +926,7 @@ def buscar(filtros: Filtros, portales_activos: list[str] | None = None) -> list[
             print(f"  [!] Portal desconocido: {nombre}")
             continue
         portal = cls()
+        portal.usar_browser = usar_browser
         try:
             resultados = portal.buscar(filtros)
             print(f"  [{portal.NOMBRE}] {len(resultados)} resultado(s) encontrado(s)")
@@ -759,6 +934,15 @@ def buscar(filtros: Filtros, portales_activos: list[str] | None = None) -> list[
         except Exception as e:
             print(f"  [{portal.NOMBRE}] Error: {e}")
         time.sleep(1)
+
+    # Cerrar browser si se usó
+    global _browser_context
+    if _browser_context is not None:
+        try:
+            _browser_context.browser.close()
+        except Exception:
+            pass
+        _browser_context = None
 
     return todos
 
@@ -805,6 +989,11 @@ Ejemplos:
   %(prog)s -u valencia --hab-min 2 --metros-min 80 --precio-max 200000
   %(prog)s -u sevilla -p idealista,fotocasa --json
   %(prog)s -u malaga --precio-min 100000 --precio-max 300000 --hab-min 3
+  %(prog)s -u madrid -o alquiler --precio-max 1800 --browser    # Usa navegador headless
+
+Modo browser (recomendado para Fotocasa):
+  pip install playwright && playwright install chromium
+  Luego usa --browser para renderizar JavaScript y obtener todos los resultados.
 
 Configuración API Idealista:
   Crea un archivo .env junto al script con:
@@ -837,6 +1026,9 @@ Configuración API Idealista:
                         help="Portales a consultar separados por coma (default: todos)")
     parser.add_argument("--json", action="store_true",
                         help="Salida en formato JSON")
+    parser.add_argument("--browser", action="store_true",
+                        help="Usar navegador headless (Playwright) para cargar JavaScript. "
+                             "Necesario para Fotocasa. Requiere: pip install playwright && playwright install chromium")
 
     args = parser.parse_args()
 
@@ -866,7 +1058,10 @@ Configuración API Idealista:
         print(f"  Superficie: {filtros.metros_min}+ m²")
     print()
 
-    resultados = buscar(filtros, portales_activos)
+    if args.browser:
+        print("  Modo browser activado (Playwright headless)\n")
+
+    resultados = buscar(filtros, portales_activos, usar_browser=args.browser)
 
     if args.json:
         mostrar_json(resultados)

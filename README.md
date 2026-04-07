@@ -119,14 +119,19 @@ Buscador unificado de viviendas que consulta **Idealista**, **Fotocasa**, **Tecn
 
 - Python 3.10+
 - Dependencias: `requests`, `beautifulsoup4`, `lxml`
+- Opcional: `playwright` (para modo `--browser`)
 
 ### Instalacion
 
 ```bash
-# Instalar dependencias
+# Instalar dependencias basicas
 pip install requests beautifulsoup4 lxml
 
-# Dar permisos de ejecucion
+# (Recomendado) Instalar Playwright para modo --browser
+pip install playwright
+playwright install chromium
+
+# Dar permisos de ejecucion (Linux/Mac)
 chmod +x buscador_casas.py
 ```
 
@@ -151,6 +156,7 @@ python3 buscador_casas.py -u <ciudad> [opciones]
 | `--pagina <n>` | Pagina de resultados (default: 1) |
 | `-p, --portales <lista>` | Portales a consultar separados por coma (default: todos) |
 | `--json` | Salida en formato JSON en vez de tabla |
+| `--browser` | Usar navegador headless (Playwright) para renderizar JavaScript. **Recomendado para Fotocasa** |
 
 ### Ejemplos
 
@@ -169,6 +175,12 @@ python3 buscador_casas.py -u sevilla -p idealista,fotocasa --json
 
 # Pisos grandes en Malaga entre 100k y 300k
 python3 buscador_casas.py -u malaga --precio-min 100000 --precio-max 300000 --hab-min 3
+
+# Modo browser (renderiza JavaScript — recomendado para resultados completos)
+python3 buscador_casas.py -u madrid -o alquiler --precio-max 1800 --browser
+
+# Modo browser + JSON + solo Fotocasa
+python3 buscador_casas.py -u barcelona -o alquiler --precio-max 1500 -p fotocasa --browser --json
 ```
 
 ### Ciudades soportadas

@@ -100,6 +100,26 @@ def get_browser_page(url, wait_selector=None, wait_seconds=3):
     page = _browser_context.new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        # Aceptar cookies / cerrar popups comunes
+        for selector in [
+            "button#didomi-notice-agree-button",   # Didomi (Fotocasa)
+            "button[data-testid='TcfAccept']",
+            "button.sui-AtomButton--primary",
+            "button:has-text('Aceptar')",
+            "button:has-text('Aceptar todo')",
+            "button:has-text('Aceptar y cerrar')",
+            "button:has-text('Accept')",
+        ]:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=1500):
+                    btn.click()
+                    page.wait_for_timeout(500)
+                    break
+            except Exception:
+                continue
+
         if wait_selector:
             try:
                 page.wait_for_selector(wait_selector, timeout=10000)
@@ -108,18 +128,22 @@ def get_browser_page(url, wait_selector=None, wait_seconds=3):
         page.wait_for_timeout(wait_seconds * 1000)
 
         # Scroll progresivo hasta el final para cargar todos los ítems lazy
-        altura_total = page.evaluate("document.body.scrollHeight")
-        paso = 800
-        pos = 0
-        while pos < altura_total:
-            pos = min(pos + paso, altura_total)
-            page.evaluate(f"window.scrollTo(0, {pos})")
-            page.wait_for_timeout(300)
-            # Actualizar altura total por si se cargaron más elementos
+        prev_height = 0
+        for _ in range(50):  # máx 50 scrolls
             altura_total = page.evaluate("document.body.scrollHeight")
+            if altura_total <= prev_height:
+                break
+            prev_height = altura_total
+            paso = 800
+            pos = page.evaluate("window.pageYOffset") or 0
+            target = min(pos + paso, altura_total)
+            page.evaluate(f"window.scrollTo(0, {target})")
+            page.wait_for_timeout(400)
 
-        # Espera final para que termine de renderizar
+        # Scroll final al fondo absoluto
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(1000)
+
         html = page.content()
         return html
     except Exception as e:
@@ -652,25 +676,34 @@ class Fotocasa(PortalInmobiliario):
     def _buscar_browser(self, filtros: Filtros) -> list[Vivienda]:
         todos = []
         pagina = filtros.pagina
+        paginas_vacias = 0
+
         while True:
             url = self._build_url_pagina(filtros, pagina)
             print(f"  [{self.NOMBRE}] Navegador headless — página {pagina}: {url}")
             html = get_browser_page(url, wait_selector="article", wait_seconds=4)
             if not html:
                 break
+
             soup = BeautifulSoup(html, "lxml")
+            n_articles = len(soup.select("article"))
+            print(f"  [{self.NOMBRE}]   HTML: {n_articles} <article> encontrados")
 
             # Intentar __NEXT_DATA__ primero
             resultados = self._parse_next_data(soup)
             if not resultados:
                 resultados = self._parse_html_browser(soup)
+
             if not resultados:
-                break
+                paginas_vacias += 1
+                if paginas_vacias >= 2:
+                    print(f"  [{self.NOMBRE}]   2 páginas vacías seguidas, parando.")
+                    break
+            else:
+                paginas_vacias = 0
+                todos.extend(resultados)
+                print(f"  [{self.NOMBRE}]   → {len(resultados)} en pág {pagina} ({len(todos)} total)")
 
-            todos.extend(resultados)
-            print(f"  [{self.NOMBRE}]   → {len(resultados)} en pág {pagina} ({len(todos)} total)")
-
-            # Siguiente página solo si se pidió explícitamente más de una
             if pagina >= filtros.paginas_max:
                 break
             pagina += 1

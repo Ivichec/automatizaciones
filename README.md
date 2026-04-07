@@ -108,3 +108,77 @@ refactor: UserService.java (UserService) [+30/-45]
 ### Detener el modo auto-commit
 
 Presiona `Ctrl+C` para detener el bucle cuando esta en modo auto.
+
+---
+
+## buscador_casas.py
+
+Buscador unificado de viviendas que consulta **Idealista**, **Fotocasa**, **Tecnocasa** y **Redpiso** con filtros comunes y muestra los resultados en tabla o JSON.
+
+### Requisitos
+
+- Python 3.10+
+- Dependencias: `requests`, `beautifulsoup4`, `lxml`
+
+### Instalacion
+
+```bash
+# Instalar dependencias
+pip install requests beautifulsoup4 lxml
+
+# Dar permisos de ejecucion
+chmod +x buscador_casas.py
+```
+
+### Uso
+
+```bash
+python3 buscador_casas.py -u <ciudad> [opciones]
+```
+
+### Opciones
+
+| Flag | Descripcion |
+|------|-------------|
+| `-u, --ubicacion <ciudad>` | Ciudad donde buscar **(obligatorio)** |
+| `-o, --operacion <tipo>` | `venta` o `alquiler` (default: venta) |
+| `--precio-min <euros>` | Precio minimo |
+| `--precio-max <euros>` | Precio maximo |
+| `--hab-min <n>` | Minimo de habitaciones |
+| `--hab-max <n>` | Maximo de habitaciones |
+| `--metros-min <m2>` | Superficie minima en m2 |
+| `--metros-max <m2>` | Superficie maxima en m2 |
+| `--pagina <n>` | Pagina de resultados (default: 1) |
+| `-p, --portales <lista>` | Portales a consultar separados por coma (default: todos) |
+| `--json` | Salida en formato JSON en vez de tabla |
+
+### Ejemplos
+
+```bash
+# Buscar pisos en venta en Madrid
+python3 buscador_casas.py -u madrid
+
+# Alquiler en Barcelona hasta 1200 euros
+python3 buscador_casas.py -u barcelona -o alquiler --precio-max 1200
+
+# Venta en Valencia, 2+ hab, 80+ m2, hasta 200k
+python3 buscador_casas.py -u valencia --hab-min 2 --metros-min 80 --precio-max 200000
+
+# Solo buscar en Idealista y Fotocasa, salida JSON
+python3 buscador_casas.py -u sevilla -p idealista,fotocasa --json
+
+# Pisos grandes en Malaga entre 100k y 300k
+python3 buscador_casas.py -u malaga --precio-min 100000 --precio-max 300000 --hab-min 3
+```
+
+### Ciudades soportadas
+
+Madrid, Barcelona, Valencia, Sevilla, Malaga, Zaragoza, Bilbao, Alicante, Cordoba, Granada, Murcia, Palma, Valladolid, Santander, Pamplona, y mas.
+
+Para otras ciudades, usa el nombre directamente (ej: `-u toledo`) y el script intentara construir la URL automaticamente.
+
+### Notas
+
+- Los portales pueden bloquear peticiones automatizadas. Si recibes errores 403, espera unos minutos antes de reintentar.
+- Los selectores HTML dependen de la estructura actual de cada web. Si un portal cambia su diseño, puede ser necesario actualizar los selectores.
+- Usa la opcion `--json` para procesar los resultados con otras herramientas (jq, scripts, etc.).

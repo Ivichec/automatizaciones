@@ -481,7 +481,12 @@ class Fotocasa(PortalInmobiliario):
     def _build_url(self, filtros: Filtros) -> str:
         loc = self.UBICACIONES.get(filtros.ubicacion.lower(), f"{filtros.ubicacion}-capital")
         op = "compra" if filtros.operacion == "venta" else "alquiler"
-        url = f"{self.BASE}/es/{op}/viviendas/{loc}/todas-las-zonas/l"
+
+        # Paginación: /l para pág 1, /l/2 para pág 2, etc.
+        if filtros.pagina > 1:
+            url = f"{self.BASE}/es/{op}/viviendas/{loc}/todas-las-zonas/l/{filtros.pagina}"
+        else:
+            url = f"{self.BASE}/es/{op}/viviendas/{loc}/todas-las-zonas/l"
 
         params = {}
         if filtros.precio_min:
@@ -496,8 +501,6 @@ class Fotocasa(PortalInmobiliario):
             params["minRooms"] = filtros.habitaciones_min
         if filtros.habitaciones_max:
             params["maxRooms"] = filtros.habitaciones_max
-        if filtros.pagina > 1:
-            params["currentPage"] = filtros.pagina
         if params:
             url += "?" + urlencode(params)
         return url

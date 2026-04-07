@@ -59,6 +59,7 @@ class Filtros:
     metros_min: int = 0
     metros_max: int = 0
     pagina: int = 1
+    paginas_max: int = 1   # páginas a recorrer en modo browser
 
 @dataclass
 class Vivienda:
@@ -78,7 +79,7 @@ class Vivienda:
 _browser_context = None
 
 def get_browser_page(url, wait_selector=None, wait_seconds=3):
-    """Navega a una URL con Playwright y devuelve el HTML renderizado."""
+    """Navega a una URL con Playwright, hace scroll completo y devuelve el HTML renderizado."""
     global _browser_context
     if not PLAYWRIGHT_DISPONIBLE:
         print("  [!] Playwright no instalado. Ejecuta: pip install playwright && playwright install chromium")
@@ -104,11 +105,21 @@ def get_browser_page(url, wait_selector=None, wait_seconds=3):
                 page.wait_for_selector(wait_selector, timeout=10000)
             except Exception:
                 pass
-        # Espera extra para que cargue contenido dinámico
         page.wait_for_timeout(wait_seconds * 1000)
-        # Scroll para triggerear lazy loading
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-        page.wait_for_timeout(1500)
+
+        # Scroll progresivo hasta el final para cargar todos los ítems lazy
+        altura_total = page.evaluate("document.body.scrollHeight")
+        paso = 800
+        pos = 0
+        while pos < altura_total:
+            pos = min(pos + paso, altura_total)
+            page.evaluate(f"window.scrollTo(0, {pos})")
+            page.wait_for_timeout(300)
+            # Actualizar altura total por si se cargaron más elementos
+            altura_total = page.evaluate("document.body.scrollHeight")
+
+        # Espera final para que termine de renderizar
+        page.wait_for_timeout(1000)
         html = page.content()
         return html
     except Exception as e:
@@ -609,76 +620,118 @@ class Fotocasa(PortalInmobiliario):
         return resultados
 
     def buscar(self, filtros: Filtros) -> list[Vivienda]:
-        url = self._build_url(filtros)
-        print(f"  [{self.NOMBRE}] Buscando en: {url}")
-
-        # Modo browser: renderiza JavaScript completo
         if self.usar_browser:
-            print(f"  [{self.NOMBRE}] Usando navegador headless...")
-            html = get_browser_page(url, wait_selector="article", wait_seconds=4)
-            if html:
-                soup = BeautifulSoup(html, "lxml")
-                resultados = self._parse_next_data(soup)
-                if resultados:
-                    return resultados
-                return self._parse_html_browser(soup)
-            return []
+            return self._buscar_browser(filtros)
 
         # Modo requests
+        url = self._build_url(filtros)
+        print(f"  [{self.NOMBRE}] Buscando en: {url}")
         resp = self._get(url)
         if not resp:
             return []
-
         soup = BeautifulSoup(resp.text, "lxml")
         resultados = self._parse_next_data(soup)
         if resultados:
             return resultados
         return self._parse_html(soup)
 
-    def _parse_html_browser(self, soup: BeautifulSoup) -> list[Vivienda]:
-        """Parseo HTML tras renderizado completo con browser."""
-        resultados = []
+    def _build_url_pagina(self, filtros: Filtros, pagina: int) -> str:
+        """Construye URL para una página específica."""
+        f = Filtros(
+            operacion=filtros.operacion, ubicacion=filtros.ubicacion,
+            precio_min=filtros.precio_min, precio_max=filtros.precio_max,
+            metros_min=filtros.metros_min, metros_max=filtros.metros_max,
+            habitaciones_min=filtros.habitaciones_min, habitaciones_max=filtros.habitaciones_max,
+            pagina=pagina,
+        )
+        return self._build_url(f)
 
-        # Con browser el DOM completo está disponible — buscar tarjetas de listados
+    def _buscar_browser(self, filtros: Filtros) -> list[Vivienda]:
+        todos = []
+        pagina = filtros.pagina
+        while True:
+            url = self._build_url_pagina(filtros, pagina)
+            print(f"  [{self.NOMBRE}] Navegador headless — página {pagina}: {url}")
+            html = get_browser_page(url, wait_selector="article", wait_seconds=4)
+            if not html:
+                break
+            soup = BeautifulSoup(html, "lxml")
+
+            # Intentar __NEXT_DATA__ primero
+            resultados = self._parse_next_data(soup)
+            if not resultados:
+                resultados = self._parse_html_browser(soup)
+            if not resultados:
+                break
+
+            todos.extend(resultados)
+            print(f"  [{self.NOMBRE}]   → {len(resultados)} en pág {pagina} ({len(todos)} total)")
+
+            # Siguiente página solo si se pidió explícitamente más de una
+            if pagina >= filtros.paginas_max:
+                break
+            pagina += 1
+            time.sleep(1.5)
+
+        return todos
+
+    def _parse_html_browser(self, soup: BeautifulSoup) -> list[Vivienda]:
+        """Parseo HTML tras renderizado completo con browser — extrae campos limpios."""
+        resultados = []
         items = soup.select("article")
+
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
 
-            # Buscar enlace principal
-            link = item.select_one("a[href*='/es/']")
+            # URL y título — desde el enlace al detalle
+            link = item.select_one("a[href*='/es/alquiler/vivienda/'], a[href*='/es/compra/vivienda/']")
             if not link:
-                link = item.select_one("a[href]")
+                link = item.select_one("a[href*='/es/']")
             if link:
                 href = link.get("href", "")
                 v.url = href if href.startswith("http") else self.BASE + href
-                v.titulo = link.get("title", "") or ""
 
-            # Precio — buscar texto con formato de precio
-            for el in item.select("span, div"):
+            # Título — desde atributo title del enlace, o heading
+            if link and link.get("title"):
+                v.titulo = link["title"]
+            else:
+                h = item.select_one("h2, h3, [class*='Title'], [class*='title']")
+                if h:
+                    v.titulo = h.get_text(strip=True)[:80]
+
+            # Precio — primer elemento que tenga solo precio (ej: "1.800 €/mes")
+            for el in item.select("span"):
                 txt = el.get_text(strip=True)
-                if re.search(r'[\d.,]+\s*€/mes|[\d.,]+\s*€', txt) and not v.precio:
+                if re.fullmatch(r'[\d.,]+\s*€(?:/mes)?', txt):
                     v.precio = txt
                     break
-
-            # Características — habitaciones y metros
-            for el in item.select("span, li, div"):
-                txt = el.get_text(strip=True)
-                if not txt or len(txt) > 30:
-                    continue
-                if re.search(r'\d+\s*habs?\.?', txt, re.I) and not v.habitaciones:
-                    v.habitaciones = txt.strip("·").strip()
-                elif re.search(r'\d+\s*m[²2]', txt) and not v.metros:
-                    v.metros = txt.strip("·").strip()
-
-            # Titulo fallback si está vacío
-            if not v.titulo:
+            # Fallback si el precio viene con texto extra
+            if not v.precio:
                 for el in item.select("span, div"):
                     txt = el.get_text(strip=True)
-                    if len(txt) > 20 and "€" not in txt and "hab" not in txt.lower() and "m²" not in txt:
-                        v.titulo = txt[:80]
+                    m = re.search(r'([\d.,]+\s*€(?:/mes)?)', txt)
+                    if m and len(txt) < 25:
+                        v.precio = m.group(1)
                         break
 
-            if v.precio or v.titulo:
+            # Habitaciones y metros — elementos cortos que solo contienen esa info
+            for el in item.select("span, li"):
+                txt = el.get_text(strip=True).strip("·").strip()
+                if not txt or len(txt) > 20:
+                    continue
+                if re.fullmatch(r'\d+\s*habs?\.?', txt, re.I) and not v.habitaciones:
+                    v.habitaciones = txt
+                elif re.fullmatch(r'\d+\s*m[²2]', txt) and not v.metros:
+                    v.metros = txt
+
+            # Ubicación — span con zona/barrio
+            for el in item.select("span"):
+                txt = el.get_text(strip=True)
+                if "," in txt and "Madrid" in txt and len(txt) < 60 and "€" not in txt:
+                    v.ubicacion = txt
+                    break
+
+            if v.precio or v.url:
                 resultados.append(v)
 
         return resultados
@@ -1029,6 +1082,8 @@ Configuración API Idealista:
     parser.add_argument("--browser", action="store_true",
                         help="Usar navegador headless (Playwright) para cargar JavaScript. "
                              "Necesario para Fotocasa. Requiere: pip install playwright && playwright install chromium")
+    parser.add_argument("--paginas", type=int, default=1,
+                        help="Número de páginas a recorrer en modo --browser (default: 1, máx recomendado: 20)")
 
     args = parser.parse_args()
 
@@ -1042,6 +1097,7 @@ Configuración API Idealista:
         metros_min=args.metros_min,
         metros_max=args.metros_max,
         pagina=args.pagina,
+        paginas_max=args.pagina + args.paginas - 1,
     )
 
     portales_activos = [p.strip() for p in args.portales.split(",")]

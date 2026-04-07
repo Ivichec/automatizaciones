@@ -674,40 +674,110 @@ class Fotocasa(PortalInmobiliario):
         return self._build_url(f)
 
     def _buscar_browser(self, filtros: Filtros) -> list[Vivienda]:
+        """Abre la búsqueda en el browser, parsea y clicka 'Siguiente' para paginar."""
+        global _browser_context
+        if not PLAYWRIGHT_DISPONIBLE:
+            print(f"  [{self.NOMBRE}] Playwright no instalado.")
+            return []
+
+        if _browser_context is None:
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=True)
+            _browser_context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="es-ES",
+                viewport={"width": 1920, "height": 1080},
+            )
+
+        url = self._build_url(filtros)
+        print(f"  [{self.NOMBRE}] Navegador headless: {url}")
+
+        page = _browser_context.new_page()
         todos = []
-        pagina = filtros.pagina
-        paginas_vacias = 0
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        while True:
-            url = self._build_url_pagina(filtros, pagina)
-            print(f"  [{self.NOMBRE}] Navegador headless — página {pagina}: {url}")
-            html = get_browser_page(url, wait_selector="article", wait_seconds=4)
-            if not html:
-                break
+            # Aceptar cookies
+            for selector in [
+                "button#didomi-notice-agree-button",
+                "button[data-testid='TcfAccept']",
+                "button:has-text('Aceptar')",
+                "button:has-text('Aceptar todo')",
+                "button:has-text('Aceptar y cerrar')",
+            ]:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=1500):
+                        btn.click()
+                        page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    continue
 
-            soup = BeautifulSoup(html, "lxml")
-            n_articles = len(soup.select("article"))
-            print(f"  [{self.NOMBRE}]   HTML: {n_articles} <article> encontrados")
+            for pagina in range(1, filtros.paginas_max + 1):
+                # Esperar a que carguen artículos
+                try:
+                    page.wait_for_selector("article", timeout=10000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(2000)
 
-            # Intentar __NEXT_DATA__ primero
-            resultados = self._parse_next_data(soup)
-            if not resultados:
+                # Scroll progresivo
+                for _ in range(30):
+                    prev = page.evaluate("document.body.scrollHeight")
+                    page.evaluate("window.scrollBy(0, 800)")
+                    page.wait_for_timeout(400)
+                    nuevo = page.evaluate("document.body.scrollHeight")
+                    if nuevo <= prev:
+                        break
+                page.wait_for_timeout(1000)
+
+                # Parsear
+                html = page.content()
+                soup = BeautifulSoup(html, "lxml")
                 resultados = self._parse_html_browser(soup)
+                print(f"  [{self.NOMBRE}]   Pág {pagina}: {len(resultados)} vivienda(s)")
 
-            if not resultados:
-                paginas_vacias += 1
-                if paginas_vacias >= 2:
-                    print(f"  [{self.NOMBRE}]   2 páginas vacías seguidas, parando.")
+                if resultados:
+                    todos.extend(resultados)
+
+                if pagina >= filtros.paginas_max:
                     break
-            else:
-                paginas_vacias = 0
-                todos.extend(resultados)
-                print(f"  [{self.NOMBRE}]   → {len(resultados)} en pág {pagina} ({len(todos)} total)")
 
-            if pagina >= filtros.paginas_max:
-                break
-            pagina += 1
-            time.sleep(1.5)
+                # Click en "Siguiente"
+                siguiente = None
+                for sel in [
+                    "a[aria-label='Siguiente']",
+                    "li.sui-MoleculePagination-item--next a",
+                    "a[rel='next']",
+                    "button:has-text('Siguiente')",
+                    "a:has-text('Siguiente')",
+                ]:
+                    try:
+                        el = page.locator(sel).first
+                        if el.is_visible(timeout=2000):
+                            siguiente = el
+                            break
+                    except Exception:
+                        continue
+
+                if not siguiente:
+                    print(f"  [{self.NOMBRE}]   No se encontró botón 'Siguiente', parando.")
+                    break
+
+                siguiente.click()
+                page.wait_for_timeout(2000)
+                # Scroll arriba para la nueva página
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(500)
+
+        except Exception as e:
+            print(f"  [{self.NOMBRE}] Error browser: {e}")
+        finally:
+            page.close()
 
         return todos
 
@@ -719,7 +789,7 @@ class Fotocasa(PortalInmobiliario):
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
 
-            # URL y título — desde el enlace al detalle
+            # URL — enlace al detalle del piso
             link = item.select_one("a[href*='/es/alquiler/vivienda/'], a[href*='/es/compra/vivienda/']")
             if not link:
                 link = item.select_one("a[href*='/es/']")
@@ -727,45 +797,36 @@ class Fotocasa(PortalInmobiliario):
                 href = link.get("href", "")
                 v.url = href if href.startswith("http") else self.BASE + href
 
-            # Título — desde atributo title del enlace, o heading
-            if link and link.get("title"):
-                v.titulo = link["title"]
-            else:
-                h = item.select_one("h2, h3, [class*='Title'], [class*='title']")
-                if h:
-                    v.titulo = h.get_text(strip=True)[:80]
+            # Extraer todo el texto del artículo para parsing
+            full_text = item.get_text(" ", strip=True)
 
-            # Precio — primer elemento que tenga solo precio (ej: "1.800 €/mes")
-            for el in item.select("span"):
-                txt = el.get_text(strip=True)
-                if re.fullmatch(r'[\d.,]+\s*€(?:/mes)?', txt):
-                    v.precio = txt
-                    break
-            # Fallback si el precio viene con texto extra
-            if not v.precio:
-                for el in item.select("span, div"):
-                    txt = el.get_text(strip=True)
-                    m = re.search(r'([\d.,]+\s*€(?:/mes)?)', txt)
-                    if m and len(txt) < 25:
-                        v.precio = m.group(1)
-                        break
+            # Precio — buscar patrón X.XXX €/mes o X.XXX €
+            m = re.search(r'([\d.,]+\s*€(?:/mes)?)', full_text)
+            if m:
+                v.precio = m.group(1)
 
-            # Habitaciones y metros — elementos cortos que solo contienen esa info
-            for el in item.select("span, li"):
-                txt = el.get_text(strip=True).strip("·").strip()
-                if not txt or len(txt) > 20:
-                    continue
-                if re.fullmatch(r'\d+\s*habs?\.?', txt, re.I) and not v.habitaciones:
-                    v.habitaciones = txt
-                elif re.fullmatch(r'\d+\s*m[²2]', txt) and not v.metros:
-                    v.metros = txt
+            # Habitaciones
+            m = re.search(r'(\d+)\s*habs?\.?', full_text, re.I)
+            if m:
+                v.habitaciones = f"{m.group(1)} habs"
 
-            # Ubicación — span con zona/barrio
-            for el in item.select("span"):
-                txt = el.get_text(strip=True)
-                if "," in txt and "Madrid" in txt and len(txt) < 60 and "€" not in txt:
-                    v.ubicacion = txt
-                    break
+            # Metros
+            m = re.search(r'(\d+)\s*m[²2]', full_text)
+            if m:
+                v.metros = f"{m.group(1)} m²"
+
+            # Título — tipo de vivienda + ubicación desde el texto
+            # Patterns: "Piso con ...", "Estudio en ...", "Ático con ..."
+            m = re.search(r'((?:Piso|Estudio|Ático|Apartamento|Dúplex|Casa|Chalet|Loft)\w*(?:con\s+\w+)?\s*en\s+[^·€]+)', full_text)
+            if m:
+                v.titulo = m.group(1).strip()[:80]
+            elif link and link.get("title"):
+                v.titulo = link["title"][:80]
+
+            # Ubicación — buscar "en ZONA, Barrio" o similar
+            m = re.search(r'en\s+([^·€]{5,50}?,\s*[^·€]{3,30})', full_text)
+            if m:
+                v.ubicacion = m.group(1).strip()
 
             if v.precio or v.url:
                 resultados.append(v)

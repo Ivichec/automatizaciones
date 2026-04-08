@@ -674,7 +674,7 @@ class Fotocasa(PortalInmobiliario):
         return self._build_url(f)
 
     def _buscar_browser(self, filtros: Filtros) -> list[Vivienda]:
-        """Abre la búsqueda en el browser, parsea y clicka 'Siguiente' para paginar."""
+        """Abre la búsqueda en el browser, scrollea para cargar todo y parsea."""
         global _browser_context
         if not PLAYWRIGHT_DISPONIBLE:
             print(f"  [{self.NOMBRE}] Playwright no instalado.")
@@ -696,7 +696,6 @@ class Fotocasa(PortalInmobiliario):
         print(f"  [{self.NOMBRE}] Navegador headless: {url}")
 
         page = _browser_context.new_page()
-        todos = []
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
@@ -717,105 +716,75 @@ class Fotocasa(PortalInmobiliario):
                 except Exception:
                     continue
 
-            for pagina in range(1, filtros.paginas_max + 1):
-                # Esperar a que carguen artículos
-                try:
-                    page.wait_for_selector("article", timeout=10000)
-                except Exception:
-                    pass
-                page.wait_for_timeout(2000)
+            # Esperar carga inicial
+            try:
+                page.wait_for_selector("article", timeout=10000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
 
-                # Scroll progresivo
-                for _ in range(30):
-                    prev = page.evaluate("document.body.scrollHeight")
-                    page.evaluate("window.scrollBy(0, 800)")
+            # Cargar más resultados: scroll + click "Ver más" hasta paginas_max rondas
+            for ronda in range(filtros.paginas_max):
+                # Scroll completo hasta abajo
+                for _ in range(40):
+                    prev_h = page.evaluate("document.body.scrollHeight")
+                    page.evaluate("window.scrollBy(0, 900)")
                     page.wait_for_timeout(400)
-                    nuevo = page.evaluate("document.body.scrollHeight")
-                    if nuevo <= prev:
+                    new_h = page.evaluate("document.body.scrollHeight")
+                    if new_h <= prev_h:
                         break
                 page.wait_for_timeout(1000)
 
-                # Parsear
-                html = page.content()
-                soup = BeautifulSoup(html, "lxml")
-                resultados = self._parse_html_browser(soup)
-                print(f"  [{self.NOMBRE}]   Pág {pagina}: {len(resultados)} vivienda(s)")
+                n_articles = page.evaluate("document.querySelectorAll('article').length")
+                print(f"  [{self.NOMBRE}]   Ronda {ronda + 1}: {n_articles} articles en DOM")
 
-                if resultados:
-                    todos.extend(resultados)
-
-                if pagina >= filtros.paginas_max:
+                if ronda >= filtros.paginas_max - 1:
                     break
 
-                # Debug: mostrar qué hay en la zona de paginación
-                pag_info = page.evaluate("""() => {
-                    const nav = document.querySelector('nav, [class*="aginat"], [class*="ager"]');
-                    const links = document.querySelectorAll('a[href*="currentPage"], a[href*="/l/"], [class*="aginat"] a, nav a');
-                    const buttons = document.querySelectorAll('[class*="aginat"] button, nav button');
-                    return {
-                        nav_html: nav ? nav.outerHTML.substring(0, 500) : 'NO NAV FOUND',
-                        links: Array.from(links).slice(0, 10).map(a => ({text: a.textContent.trim(), href: a.href, classes: a.className})),
-                        buttons: Array.from(buttons).slice(0, 5).map(b => ({text: b.textContent.trim(), classes: b.className})),
-                        all_navs: Array.from(document.querySelectorAll('nav')).map(n => n.className),
-                    };
-                }""")
-                print(f"  [{self.NOMBRE}]   Debug paginación: {json.dumps(pag_info, ensure_ascii=False, indent=2)[:600]}")
-
-                # Intentar click por número de página
-                pagina_siguiente = pagina + 1
+                # Buscar botón "Ver más" / "Mostrar más" / paginación
                 clicked = False
-
-                # Método 1: buscar link con el número de página
                 for sel in [
-                    f"a:has-text('{pagina_siguiente}')",
-                    f"[class*='aginat'] a:has-text('{pagina_siguiente}')",
-                    f"nav a:has-text('{pagina_siguiente}')",
-                    f"button:has-text('{pagina_siguiente}')",
+                    "button:has-text('Ver más')",
+                    "button:has-text('Mostrar más')",
+                    "button:has-text('Cargar más')",
+                    "a:has-text('Ver más')",
+                    "a:has-text('Mostrar más')",
+                    "[class*='Pagination'] a",
+                    "[class*='pagination'] a",
+                    f"a:has-text('{ronda + 2}')",
+                    "a[rel='next']",
+                    "a:has-text('Siguiente')",
+                    "button:has-text('Siguiente')",
                 ]:
                     try:
                         el = page.locator(sel).first
-                        if el.is_visible(timeout=1500):
+                        if el.is_visible(timeout=1000):
                             el.click()
                             clicked = True
+                            page.wait_for_timeout(3000)
                             break
                     except Exception:
                         continue
 
-                # Método 2: buscar "Siguiente" / "Next" / ">"
                 if not clicked:
-                    for sel in [
-                        "a[aria-label*='iguiente']",
-                        "a[aria-label*='ext']",
-                        "li.sui-MoleculePagination-item--next a",
-                        "[class*='next'] a",
-                        "[class*='Next'] a",
-                        "a[rel='next']",
-                        "a:has-text('Siguiente')",
-                        "a:has-text('>')",
-                        "button:has-text('Siguiente')",
-                        "button:has-text('>')",
-                    ]:
-                        try:
-                            el = page.locator(sel).first
-                            if el.is_visible(timeout=1500):
-                                el.click()
-                                clicked = True
-                                break
-                        except Exception:
-                            continue
+                    # Scroll infinito: intentar cargar más con scroll
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(3000)
+                    new_count = page.evaluate("document.querySelectorAll('article').length")
+                    if new_count <= n_articles:
+                        print(f"  [{self.NOMBRE}]   No se cargaron más resultados, parando.")
+                        break
 
-                if not clicked:
-                    print(f"  [{self.NOMBRE}]   No se encontró paginación, parando.")
-                    break
-
-                page.wait_for_timeout(3000)
+            # Parsear todo de una vez
+            html = page.content()
+            soup = BeautifulSoup(html, "lxml")
+            return self._parse_html_browser(soup)
 
         except Exception as e:
             print(f"  [{self.NOMBRE}] Error browser: {e}")
+            return []
         finally:
             page.close()
-
-        return todos
 
     def _parse_html_browser(self, soup: BeautifulSoup) -> list[Vivienda]:
         """Parseo HTML tras renderizado completo con browser — extrae campos limpios."""
@@ -847,7 +816,7 @@ class Fotocasa(PortalInmobiliario):
             full_text = item.get_text(" ", strip=True)
 
             # Descartar articles sin contenido útil (nav, ads, etc.)
-            if len(full_text) < 20 or "€" not in full_text:
+            if len(full_text) < 20:
                 continue
 
             # Precio
@@ -881,7 +850,7 @@ class Fotocasa(PortalInmobiliario):
                 if m:
                     v.ubicacion = m.group(1).strip() + ", Madrid"
 
-            if v.precio:
+            if v.precio or v.url:
                 resultados.append(v)
 
         return resultados

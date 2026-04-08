@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 buscador_casas.py — Buscador unificado de viviendas en portales inmobiliarios españoles.
@@ -673,8 +674,207 @@ class Fotocasa(PortalInmobiliario):
         )
         return self._build_url(f)
 
+    def _dismiss_modals(self, page):
+        """Cierra modales/popups que bloquean interacción (newsletter, alertas, etc.)."""
+        # Intentar cerrar con botones de cierre comunes
+        for selector in [
+            ".sui-MoleculeModal button[aria-label='Cerrar']",
+            ".sui-MoleculeModal button[aria-label='Close']",
+            "#modal-react-portal button[aria-label='Cerrar']",
+            "#modal-react-portal button[aria-label='Close']",
+            ".sui-MoleculeModal .sui-AtomButton--secondary",
+            ".sui-MoleculeModal button:has-text('No, gracias')",
+            ".sui-MoleculeModal button:has-text('Cerrar')",
+            "#modal-react-portal button:has-text('No, gracias')",
+            "#modal-react-portal button:has-text('Cerrar')",
+        ]:
+            try:
+                btn = page.locator(selector).first
+                if btn.is_visible(timeout=500):
+                    btn.click()
+                    page.wait_for_timeout(500)
+                    return
+            except Exception:
+                continue
+
+        # Fallback: eliminar el modal del DOM directamente
+        removed = page.evaluate("""() => {
+            const portal = document.querySelector('#modal-react-portal');
+            if (portal && portal.children.length > 0) {
+                portal.innerHTML = '';
+                return true;
+            }
+            const modals = document.querySelectorAll('.sui-MoleculeModal');
+            if (modals.length > 0) {
+                modals.forEach(m => m.remove());
+                return true;
+            }
+            return false;
+        }""")
+        if removed:
+            page.wait_for_timeout(300)
+
+    def _scroll_hydrate_articles(self, page) -> int:
+        """Scroll cada article a la vista para activar IntersectionObserver lazy loading.
+        Devuelve el número de artículos con contenido real."""
+        n_articles = page.evaluate("document.querySelectorAll('article').length")
+        if n_articles == 0:
+            return 0
+
+        # Primer pase: scroll cada artículo a la vista
+        for i in range(n_articles):
+            page.evaluate(f"""() => {{
+                const arts = document.querySelectorAll('article');
+                if (arts[{i}]) arts[{i}].scrollIntoView({{behavior: 'instant', block: 'center'}});
+            }}""")
+            page.wait_for_timeout(800)
+
+        # Segundo pase más rápido por si alguno no se cargó
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+        for i in range(n_articles):
+            page.evaluate(f"""() => {{
+                const arts = document.querySelectorAll('article');
+                if (arts[{i}]) arts[{i}].scrollIntoView({{behavior: 'instant', block: 'center'}});
+            }}""")
+            page.wait_for_timeout(400)
+
+        page.wait_for_timeout(1000)
+
+        # Contar artículos con contenido real (tienen links dentro)
+        n_loaded = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('article'))
+                .filter(a => a.querySelectorAll('a[href]').length > 0).length;
+        }""")
+        return n_loaded
+
+
+    def _resolve_location_ids(self, page, filtros: Filtros) -> str | None:
+        """Obtiene combinedLocationIds llamando al API de Fotocasa desde el contexto del browser."""
+        loc = self.UBICACIONES.get(filtros.ubicacion.lower(), f"{filtros.ubicacion}-capital")
+        result = page.evaluate(f"""async () => {{
+            try {{
+                const resp = await fetch(
+                    'https://web.gw.fotocasa.es/v2/propertysearch/urllocationsegments?location={loc}&zone=todas-las-zonas',
+                    {{headers: {{'Referer': 'https://www.fotocasa.es/'}}}}
+                );
+                const data = await resp.json();
+                return data.ids || null;
+            }} catch(e) {{ return null; }}
+        }}""")
+        return result
+
+    def _fetch_api_page(self, page, location_ids: str, filtros: Filtros, page_num: int) -> list[dict]:
+        """Llama al API interno de Fotocasa para obtener listados de una página."""
+        op = "alquiler" if filtros.operacion in ("alquiler", "rent") else "venta"
+        transaction_type = 3 if op == "alquiler" else 1
+
+        params = {
+            "combinedLocationIds": location_ids,
+            "culture": "es-ES",
+            "propertyTypeId": "2",
+            "transactionTypeId": str(transaction_type),
+            "pageNumber": str(page_num),
+            "sort": "scoring",
+            "isNewConstruction": "false",
+        }
+        if filtros.precio_max > 0:
+            params["maxPrice"] = str(filtros.precio_max)
+        if filtros.precio_min > 0:
+            params["minPrice"] = str(filtros.precio_min)
+        if filtros.habitaciones_min > 0:
+            params["minRooms"] = str(filtros.habitaciones_min)
+        if filtros.metros_min > 0:
+            params["minSurface"] = str(filtros.metros_min)
+
+        params_js = json.dumps(params)
+        result = page.evaluate(f"""async () => {{
+            try {{
+                const resp = await fetch(
+                    'https://web.gw.fotocasa.es/v2/propertysearch/search?' + new URLSearchParams({params_js}).toString(),
+                    {{headers: {{'Accept': 'application/json', 'Referer': 'https://www.fotocasa.es/'}}}}
+                );
+                if (!resp.ok) return {{error: resp.status}};
+                const data = await resp.json();
+                return {{
+                    count: data.count || 0,
+                    listings: data.realEstates || [],
+                }};
+            }} catch(e) {{ return {{error: e.message}}; }}
+        }}""")
+        if isinstance(result, dict) and "error" in result:
+            print(f"  [{self.NOMBRE}]   API error pág {page_num}: {result['error']}")
+            return []
+        return result.get("listings", [])
+
+    def _parse_api_listings(self, listings: list[dict], urls_vistas: set) -> list[Vivienda]:
+        """Convierte listados del API JSON en objetos Vivienda."""
+        resultados = []
+        for item in listings:
+            # URL
+            detail = item.get("detail", {})
+            url_path = detail.get("es", "") if isinstance(detail, dict) else ""
+            if not url_path:
+                continue
+            full_url = f"{self.BASE}{url_path}"
+            if full_url in urls_vistas:
+                continue
+            urls_vistas.add(full_url)
+
+            # Precio
+            precio_str = ""
+            transactions = item.get("transactions", [])
+            if transactions and isinstance(transactions, list):
+                t = transactions[0]
+                values = t.get("value", [])
+                if values:
+                    precio_val = values[0]
+                    precio_str = f"{precio_val:,.0f} € /mes".replace(",", ".")
+
+            # Features (rooms, surface)
+            features = item.get("features", [])
+            feat_map = {}
+            if isinstance(features, list):
+                for f in features:
+                    key = f.get("key", "")
+                    vals = f.get("value", [])
+                    if key and vals:
+                        feat_map[key] = vals[0]
+
+            rooms = feat_map.get("rooms", 0)
+            surface = feat_map.get("surface", 0)
+            habs_str = f"{rooms} habs" if rooms else ""
+            metros_str = f"{surface} m²" if surface else ""
+
+            # Ubicación
+            address = item.get("address", {})
+            ubication = address.get("ubication", "")
+            location = address.get("location", {})
+            district = location.get("level7", "")
+            neighborhood = location.get("level8", "")
+            location_str = ubication or f"{neighborhood}, {district}".strip(", ")
+
+            # Título (de la ubicación) y descripción
+            descripcion = item.get("description", "")
+            titulo = ubication if ubication else descripcion[:80] if descripcion else f"Vivienda {item.get('id', '')}"
+
+            v = Vivienda(
+                portal=self.NOMBRE,
+                titulo=titulo,
+                precio=precio_str,
+                ubicacion=location_str,
+                habitaciones=habs_str,
+                metros=metros_str,
+                url=full_url,
+                descripcion=descripcion[:200] if descripcion else "",
+            )
+            resultados.append(v)
+        return resultados
+
     def _buscar_browser(self, filtros: Filtros) -> list[Vivienda]:
-        """Abre la búsqueda en el browser, scrollea para cargar todo y parsea."""
+        """Página 1 via browser + scroll; páginas 2+ via API interna de Fotocasa.
+        La navegación directa a URLs de pág 2+ devuelve 403 (anti-bot),
+        pero el API interno funciona desde el contexto del browser."""
         global _browser_context
         if not PLAYWRIGHT_DISPONIBLE:
             print(f"  [{self.NOMBRE}] Playwright no instalado.")
@@ -692,12 +892,17 @@ class Fotocasa(PortalInmobiliario):
                 viewport={"width": 1920, "height": 1080},
             )
 
+        todos_resultados = []
+        urls_vistas_global = set()
+        paginas_a_recorrer = filtros.paginas_max
+
+        # Abrir página 1 via URL directa
         url = self._build_url(filtros)
         print(f"  [{self.NOMBRE}] Navegador headless: {url}")
 
         page = _browser_context.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.goto(url, wait_until="networkidle", timeout=45000)
 
             # Aceptar cookies
             for selector in [
@@ -716,96 +921,55 @@ class Fotocasa(PortalInmobiliario):
                 except Exception:
                     continue
 
-            # Esperar carga inicial
+            # ── Página 1: browser scroll + parse HTML ──
             try:
                 page.wait_for_selector("article", timeout=10000)
             except Exception:
-                pass
+                print(f"  [{self.NOMBRE}]   Pág 1: no se encontraron articles, parando.")
+                page.close()
+                return []
             page.wait_for_timeout(2000)
 
-            # Cargar más resultados: scroll + click "Ver más" hasta paginas_max rondas
-            for ronda in range(filtros.paginas_max):
-                # Scroll completo hasta abajo
-                for _ in range(40):
-                    prev_h = page.evaluate("document.body.scrollHeight")
-                    page.evaluate("window.scrollBy(0, 900)")
-                    page.wait_for_timeout(400)
-                    new_h = page.evaluate("document.body.scrollHeight")
-                    if new_h <= prev_h:
-                        break
-                page.wait_for_timeout(1000)
+            n_articles = page.evaluate("document.querySelectorAll('article').length")
+            n_loaded = self._scroll_hydrate_articles(page)
+            print(f"  [{self.NOMBRE}]   Pág 1: {n_articles} articles en DOM, {n_loaded} con contenido")
 
-                n_articles = page.evaluate("document.querySelectorAll('article').length")
-                print(f"  [{self.NOMBRE}]   Ronda {ronda + 1}: {n_articles} articles en DOM")
-
-                if ronda >= filtros.paginas_max - 1:
-                    break
-
-                # Buscar botón "Ver más" / "Mostrar más" / paginación
-                clicked = False
-                for sel in [
-                    "button:has-text('Ver más')",
-                    "button:has-text('Mostrar más')",
-                    "button:has-text('Cargar más')",
-                    "a:has-text('Ver más')",
-                    "a:has-text('Mostrar más')",
-                    "[class*='Pagination'] a",
-                    "[class*='pagination'] a",
-                    f"a:has-text('{ronda + 2}')",
-                    "a[rel='next']",
-                    "a:has-text('Siguiente')",
-                    "button:has-text('Siguiente')",
-                ]:
-                    try:
-                        el = page.locator(sel).first
-                        if el.is_visible(timeout=1000):
-                            el.click()
-                            clicked = True
-                            page.wait_for_timeout(3000)
-                            break
-                    except Exception:
-                        continue
-
-                if not clicked:
-                    # Scroll infinito: intentar cargar más con scroll
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(3000)
-                    new_count = page.evaluate("document.querySelectorAll('article').length")
-                    if new_count <= n_articles:
-                        print(f"  [{self.NOMBRE}]   No se cargaron más resultados, parando.")
-                        break
-
-            # Parsear todo de una vez
             html = page.content()
             soup = BeautifulSoup(html, "lxml")
-            return self._parse_html_browser(soup)
+            resultados_p1 = self._parse_html_browser(soup, urls_vistas_global)
+            print(f"  [{self.NOMBRE}]   Pág 1: {len(resultados_p1)} resultado(s) parseado(s)")
+            todos_resultados.extend(resultados_p1)
+
+            # ── Páginas 2+: API interna de Fotocasa ──
+            if paginas_a_recorrer > 1 and resultados_p1:
+                location_ids = self._resolve_location_ids(page, filtros)
+                if not location_ids:
+                    print(f"  [{self.NOMBRE}]   No se pudieron resolver location IDs para API.")
+                else:
+                    for pagina in range(2, paginas_a_recorrer + 1):
+                        listings = self._fetch_api_page(page, location_ids, filtros, pagina)
+                        if not listings:
+                            print(f"  [{self.NOMBRE}]   Pág {pagina}: sin resultados API, parando.")
+                            break
+                        resultados_api = self._parse_api_listings(listings, urls_vistas_global)
+                        print(f"  [{self.NOMBRE}]   Pág {pagina}: {len(resultados_api)} resultado(s) via API")
+                        if not resultados_api:
+                            break
+                        todos_resultados.extend(resultados_api)
 
         except Exception as e:
             print(f"  [{self.NOMBRE}] Error browser: {e}")
-            return []
         finally:
             page.close()
 
-    def _parse_html_browser(self, soup: BeautifulSoup) -> list[Vivienda]:
+        return todos_resultados
+
+    def _parse_html_browser(self, soup: BeautifulSoup, urls_vistas: set | None = None) -> list[Vivienda]:
         """Parseo HTML tras renderizado completo con browser — extrae campos limpios."""
         resultados = []
-        urls_vistas = set()
+        if urls_vistas is None:
+            urls_vistas = set()
         items = soup.select("article")
-
-        # Debug: guardar estructura de los primeros articles
-        debug_path = Path(__file__).parent / "debug_fotocasa.txt"
-        with open(debug_path, "w", encoding="utf-8") as f:
-            for i, item in enumerate(items[:5]):
-                f.write(f"=== ARTICLE {i} ===\n")
-                # Links
-                links = item.select("a[href]")
-                f.write(f"Links ({len(links)}):\n")
-                for a in links[:5]:
-                    f.write(f"  href={a.get('href', '')[:100]}  text={a.get_text(strip=True)[:50]}\n")
-                # Text
-                txt = item.get_text(" | ", strip=True)
-                f.write(f"Text: {txt[:300]}\n\n")
-        print(f"  [{self.NOMBRE}]   Debug guardado en: {debug_path}")
 
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
@@ -814,9 +978,19 @@ class Fotocasa(PortalInmobiliario):
             link = None
             for a in item.select("a[href]"):
                 href = a.get("href", "")
-                if "/vivienda/" in href or "/inmueble/" in href or re.search(r'/\d{6,}/', href):
+                # Fotocasa detail URLs: /es/alquiler/vivienda/.../{id}/d
+                if ("/vivienda/" in href or "/inmueble/" in href
+                        or re.search(r'/\d{6,}/', href)
+                        or re.search(r'/\d{6,}/d', href)):
                     link = a
                     break
+            if not link:
+                # Fallback: link con /alquiler/ o /compra/ en path
+                for a in item.select("a[href]"):
+                    href = a.get("href", "")
+                    if "/alquiler/" in href or "/compra/" in href:
+                        link = a
+                        break
             if not link:
                 link = item.select_one("a[href]")
             if link:
@@ -831,13 +1005,13 @@ class Fotocasa(PortalInmobiliario):
             full_text = item.get_text(" ", strip=True)
 
             # Descartar articles sin contenido útil (nav, ads, etc.)
-            if len(full_text) < 20:
+            if len(full_text) < 15:
                 continue
 
-            # Precio
-            m = re.search(r'([\d.,]+\s*€(?:/mes)?)', full_text)
+            # Precio — soportar "1.690 €/mes", "990€", "990 €", etc.
+            m = re.search(r'([\d.,]+\s*€(?:\s*/\s*mes)?)', full_text)
             if m:
-                v.precio = m.group(1)
+                v.precio = m.group(1).strip()
 
             # Habitaciones
             m = re.search(r'(\d+)\s*habs?\.?', full_text, re.I)
@@ -850,22 +1024,28 @@ class Fotocasa(PortalInmobiliario):
                 v.metros = f"{m.group(1)} m²"
 
             # Título — tipo de vivienda
-            m = re.search(r'((?:Piso|Estudio|Ático|Apartamento|Dúplex|Casa|Chalet|Loft)\S*(?:\s+con\s+\S+)?(?:\s+en\s+[^·€\d]{3,40})?)', full_text)
+            m = re.search(r'((?:Piso|Estudio|Ático|Apartamento|Dúplex|Casa|Chalet|Loft|Bajo|Planta baja)\S*(?:\s+con\s+\S+)?(?:\s+en\s+[^·€\d]{3,40})?)', full_text)
             if m:
                 v.titulo = m.group(1).strip()[:80]
             elif link and link.get("title"):
                 v.titulo = link["title"][:80]
+            else:
+                # Fallback: usar el texto del enlace principal
+                link_text = link.get_text(strip=True) if link else ""
+                if link_text and len(link_text) > 5:
+                    v.titulo = link_text[:80]
 
             # Ubicación
             m = re.search(r'en\s+([^·€\d]{3,40}?,\s*[^·€\d]{3,30})', full_text)
             if m:
                 v.ubicacion = m.group(1).strip()
             else:
-                m = re.search(r'(?:en|,)\s+(\S+(?:\s+\S+){0,3})\s+Madrid', full_text)
+                m = re.search(r'(?:en|,)\s+(\S+(?:\s+\S+){0,3})\s+(?:Madrid|Barcelona|Valencia|Sevilla|Malaga|Zaragoza)', full_text)
                 if m:
-                    v.ubicacion = m.group(1).strip() + ", Madrid"
+                    v.ubicacion = m.group(0).strip()
 
-            if v.precio or v.url:
+            # Aceptar si tiene al menos precio o URL con contenido relevante
+            if v.precio or (v.url and (v.titulo or v.metros or v.habitaciones)):
                 resultados.append(v)
 
         return resultados
@@ -1231,7 +1411,7 @@ Configuración API Idealista:
         metros_min=args.metros_min,
         metros_max=args.metros_max,
         pagina=args.pagina,
-        paginas_max=args.pagina + args.paginas - 1,
+        paginas_max=args.paginas,
     )
 
     portales_activos = [p.strip() for p in args.portales.split(",")]

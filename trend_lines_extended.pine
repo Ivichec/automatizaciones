@@ -1,127 +1,140 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
-// © LonesomeTheBlue (original) - Modified to extend ALL trend lines
+// © LonesomeTheBlue (original) - Rewritten to accumulate and extend ALL trend lines
 
-//@version=4
-study("Trend Lines Extended", overlay=true, max_bars_back = 4000)
-startyear = input(defval = 2020, title = "Start Year")
-startmonth = input(defval = 1, title = "Start Month")
-startday = input(defval = 1, title = "Start day")
-prd = input(defval = 20, title="Pivot Period", minval = 10, maxval = 50)
-PPnum = input(defval = 3, title="Number of Pivot Points to check", minval = 2, maxval = 6)
-maxline = input(defval = 3, title="Max Number of Trend Lines", minval = 1, maxval = 10)
-extendLines = input(defval = true, title = "Extend Lines to the Right")
-utcol = input(defval = color.lime, title = "Colors", inline = "tcol")
-dtcol = input(defval = color.red, title = "", inline = "tcol")
+//@version=5
+indicator("Trend Lines Extended - All", overlay=true, max_lines_count=500, max_bars_back=5000)
 
-float ph = pivothigh(prd, prd)
-float pl = pivotlow(prd, prd)
+// Inputs
+prd       = input.int(defval=20, title="Pivot Period", minval=5, maxval=50)
+maxPivots = input.int(defval=15, title="Max Pivot Points to track", minval=3, maxval=30)
+utcol     = input.color(defval=color.lime, title="Support Color", inline="tcol")
+dtcol     = input.color(defval=color.red, title="Resistance Color", inline="tcol")
+lineWidth = input.int(defval=1, title="Line Width", minval=1, maxval=4)
+removeBroken = input.bool(defval=false, title="Remove Broken Lines")
 
-var tval = array.new_float(PPnum)
-var tpos = array.new_int(PPnum)
-var bval = array.new_float(PPnum)
-var bpos = array.new_int(PPnum)
+// Pivot detection
+ph = ta.pivothigh(prd, prd)
+pl = ta.pivotlow(prd, prd)
 
-add_to_array(apointer1, apointer2, val)=>
-    array.unshift(apointer1, val)
-    array.unshift(apointer2, bar_index)
-    array.pop(apointer1)
-    array.pop(apointer2)
+// Arrays to store pivot history
+var float[] phVals = array.new_float(0)
+var int[]   phBars = array.new_int(0)
+var float[] plVals = array.new_float(0)
+var int[]   plBars = array.new_int(0)
 
-if ph
-    add_to_array(tval, tpos, ph)
+// Arrays to track drawn lines for broken-line removal
+var line[]  resistLines  = array.new_line(0)
+var float[] resistSlopes = array.new_float(0)
+var float[] resistOriginVal = array.new_float(0)
+var int[]   resistOriginBar = array.new_int(0)
 
-if pl
-    add_to_array(bval, bpos, pl)
+var line[]  supportLines  = array.new_line(0)
+var float[] supportSlopes = array.new_float(0)
+var float[] supportOriginVal = array.new_float(0)
+var int[]   supportOriginBar = array.new_int(0)
 
-// line definitions
-var bln = array.new_line(maxline, na)
-var tln = array.new_line(maxline, na)
+// ─── New pivot HIGH → check for descending resistance lines ───
+if not na(ph)
+    int   newBar = bar_index - prd
+    float newVal = ph
 
-// determine extend mode
-ext = extendLines ? extend.right : extend.none
+    if array.size(phVals) > 0
+        for i = 0 to array.size(phVals) - 1
+            float prevVal = array.get(phVals, i)
+            int   prevBar = array.get(phBars, i)
 
-// loop for pivot points to check if there is possible trend line
-countlinelo = 0
-countlinehi = 0
+            if newVal < prevVal  // descending → valid resistance
+                float slope = (newVal - prevVal) / (newBar - prevBar)
+                bool  valid = true
 
-starttime = timestamp(startyear, startmonth, startday, 0, 0, 0)
-
-if time >= starttime
-    // delete previous lines
-    for x = 0 to array.size(bln) - 1
-        line.delete(array.get(bln, x))
-    for x = 0 to array.size(tln) - 1
-        line.delete(array.get(tln, x))
-
-    for p1 = 0 to PPnum - 2
-        uv1 = 0.0
-        uv2 = 0.0
-        up1 = 0
-        up2 = 0
-        if countlinelo <= maxline
-            for p2 = PPnum - 1 to p1 + 1
-                val1 = array.get(bval, p1)
-                val2 = array.get(bval, p2)
-                pos1 = array.get(bpos, p1)
-                pos2 = array.get(bpos, p2)
-                if val1 > val2
-                    diff = (val1 - val2) / (pos1 - pos2)
-                    hline = val2 + diff
-                    lloc = bar_index
-                    lval = low
-                    valid = true
-                    for x = pos2 + 1 - prd to bar_index
-                        if close[bar_index - x] < hline
-                            valid := false
-                            break
-                        lloc := x
-                        lval := hline
-                        hline := hline + diff
-
-                    if valid
-                        uv1 := hline - diff
-                        uv2 := val2
-                        up1 := lloc
-                        up2 := pos2
+                // Validate: no close above the line between the two pivots
+                for x = prevBar - prd + 1 to newBar
+                    float lineVal = prevVal + slope * (x - prevBar)
+                    int   offset  = bar_index - x
+                    if offset >= 0 and offset < 5000 and close[offset] > lineVal
+                        valid := false
                         break
 
-        dv1 = 0.0
-        dv2 = 0.0
-        dp1 = 0
-        dp2 = 0
-        if countlinehi <= maxline
-            for p2 = PPnum - 1 to p1 + 1
-                val1 = array.get(tval, p1)
-                val2 = array.get(tval, p2)
-                pos1 = array.get(tpos, p1)
-                pos2 = array.get(tpos, p2)
-                if val1 < val2
-                    diff = (val2 - val1) / float(pos1 - pos2)
-                    hline = val2 - diff
-                    lloc = bar_index
-                    lval = high
-                    valid = true
-                    for x = pos2 + 1 - prd to bar_index
-                        if close[bar_index - x] > hline
-                            valid := false
-                            break
-                        lloc := x
-                        lval := hline
-                        hline := hline - diff
+                if valid
+                    line ln = line.new(prevBar, prevVal, newBar, newVal,
+                         color=dtcol, extend=extend.right, width=lineWidth)
+                    // Track for broken-line removal
+                    array.push(resistLines, ln)
+                    array.push(resistSlopes, slope)
+                    array.push(resistOriginVal, prevVal)
+                    array.push(resistOriginBar, prevBar)
 
-                    if valid
-                        dv1 := hline + diff
-                        dv2 := val2
-                        dp1 := lloc
-                        dp2 := pos2
+    // Store this pivot
+    array.unshift(phVals, newVal)
+    array.unshift(phBars, newBar)
+    if array.size(phVals) > maxPivots
+        array.pop(phVals)
+        array.pop(phBars)
+
+// ─── New pivot LOW → check for ascending support lines ───
+if not na(pl)
+    int   newBar = bar_index - prd
+    float newVal = pl
+
+    if array.size(plVals) > 0
+        for i = 0 to array.size(plVals) - 1
+            float prevVal = array.get(plVals, i)
+            int   prevBar = array.get(plBars, i)
+
+            if newVal > prevVal  // ascending → valid support
+                float slope = (newVal - prevVal) / (newBar - prevBar)
+                bool  valid = true
+
+                // Validate: no close below the line between the two pivots
+                for x = prevBar - prd + 1 to newBar
+                    float lineVal = prevVal + slope * (x - prevBar)
+                    int   offset  = bar_index - x
+                    if offset >= 0 and offset < 5000 and close[offset] < lineVal
+                        valid := false
                         break
 
-        // draw uptrend (support) line - ALL extended
-        if up1 != 0 and up2 != 0 and countlinelo < maxline
-            countlinelo += 1
-            array.set(bln, countlinelo - 1, line.new(up2 - prd, uv2, up1, uv1, color = utcol, extend = ext))
+                if valid
+                    line ln = line.new(prevBar, prevVal, newBar, newVal,
+                         color=utcol, extend=extend.right, width=lineWidth)
+                    // Track for broken-line removal
+                    array.push(supportLines, ln)
+                    array.push(supportSlopes, slope)
+                    array.push(supportOriginVal, prevVal)
+                    array.push(supportOriginBar, prevBar)
 
-        // draw downtrend (resistance) line - ALL extended
-        if dp1 != 0 and dp2 != 0 and countlinehi < maxline
-            countlinehi += 1
-            array.set(tln, countlinehi - 1, line.new(dp2 - prd, dv2, dp1, dv1, color = dtcol, extend = ext))
+    // Store this pivot
+    array.unshift(plVals, newVal)
+    array.unshift(plBars, newBar)
+    if array.size(plVals) > maxPivots
+        array.pop(plVals)
+        array.pop(plBars)
+
+// ─── Optional: remove lines that price has broken through ───
+if removeBroken
+    // Check resistance lines: broken if close goes above
+    if array.size(resistLines) > 0
+        for i = array.size(resistLines) - 1 to 0
+            float lSlope  = array.get(resistSlopes, i)
+            float lOriVal = array.get(resistOriginVal, i)
+            int   lOriBar = array.get(resistOriginBar, i)
+            float currentLineVal = lOriVal + lSlope * (bar_index - lOriBar)
+            if close > currentLineVal
+                line.delete(array.get(resistLines, i))
+                array.remove(resistLines, i)
+                array.remove(resistSlopes, i)
+                array.remove(resistOriginVal, i)
+                array.remove(resistOriginBar, i)
+
+    // Check support lines: broken if close goes below
+    if array.size(supportLines) > 0
+        for i = array.size(supportLines) - 1 to 0
+            float lSlope  = array.get(supportSlopes, i)
+            float lOriVal = array.get(supportOriginVal, i)
+            int   lOriBar = array.get(supportOriginBar, i)
+            float currentLineVal = lOriVal + lSlope * (bar_index - lOriBar)
+            if close < currentLineVal
+                line.delete(array.get(supportLines, i))
+                array.remove(supportLines, i)
+                array.remove(supportSlopes, i)
+                array.remove(supportOriginVal, i)
+                array.remove(supportOriginBar, i)

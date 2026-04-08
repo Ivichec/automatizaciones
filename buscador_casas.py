@@ -792,6 +792,21 @@ class Fotocasa(PortalInmobiliario):
         urls_vistas = set()
         items = soup.select("article")
 
+        # Debug: guardar estructura de los primeros articles
+        debug_path = Path(__file__).parent / "debug_fotocasa.txt"
+        with open(debug_path, "w", encoding="utf-8") as f:
+            for i, item in enumerate(items[:5]):
+                f.write(f"=== ARTICLE {i} ===\n")
+                # Links
+                links = item.select("a[href]")
+                f.write(f"Links ({len(links)}):\n")
+                for a in links[:5]:
+                    f.write(f"  href={a.get('href', '')[:100]}  text={a.get_text(strip=True)[:50]}\n")
+                # Text
+                txt = item.get_text(" | ", strip=True)
+                f.write(f"Text: {txt[:300]}\n\n")
+        print(f"  [{self.NOMBRE}]   Debug guardado en: {debug_path}")
+
         for item in items:
             v = Vivienda(portal=self.NOMBRE)
 

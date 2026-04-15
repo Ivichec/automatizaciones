@@ -1,0 +1,290 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Based on StrategyQuant X Build 143 pseudo code - Strategy 7.9.23
+// Converted to PineScript indicator with visual signals and levels
+
+//@version=6
+indicator("SQ MACD HA ATR Strategy", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ─── Strategy Parameters ───────────────────────────────────────────
+MACDMainFast    = input.int(3,    "MACD Fast Length",          minval=1)
+MACDMainSlow    = input.int(17,   "MACD Slow Length",          minval=1)
+MACDMainSmooth  = input.int(9,    "MACD Signal Smoothing",     minval=1)
+PriceEntryMult  = input.float(2.6,"Entry ATR Multiplier",      step=0.1)
+ExitAfterBars   = input.int(5,    "Exit After N Bars",         minval=1)
+StopLossCoef    = input.float(1.2,"Stop Loss ATR Multiplier",  step=0.1)
+TrailingStopCoef= input.float(2.7,"Trailing Stop ATR Mult",    step=0.1)
+ATREntryLen     = input.int(30,   "ATR Length (Entry)",        minval=1)
+ATRStopLen      = input.int(45,   "ATR Length (Stop Loss)",    minval=1)
+ATRTrailLen     = input.int(190,  "ATR Length (Trailing Stop)", minval=1)
+OrderValidBars  = input.int(111,  "Order Valid For N Bars",    minval=1)
+
+// ─── Visual Options ────────────────────────────────────────────────
+showEntryLevels = input.bool(true, "Show Entry Levels",        group="Display")
+showSLLevels    = input.bool(true, "Show Stop Loss Levels",    group="Display")
+showTrailLevels = input.bool(true, "Show Trailing Stop Levels", group="Display")
+showSignalBG    = input.bool(true, "Show Signal Background",   group="Display")
+
+// ─── MACD Calculation ──────────────────────────────────────────────
+[macdLine, signalLine, histLine] = ta.macd(close, MACDMainFast, MACDMainSlow, MACDMainSmooth)
+
+// Use previous bar's MACD value (Main[1] in pseudo code)
+macdPrev = macdLine[1]
+
+LongEntrySignal  = macdPrev > 0
+ShortEntrySignal = macdPrev < 0
+
+// Short only fires when Long is NOT active (as per pseudo code)
+ShortEntryFiltered = ShortEntrySignal and not LongEntrySignal
+
+// ─── Heiken Ashi Calculation ───────────────────────────────────────
+// Calculate Heiken Ashi values manually (needed for overlay indicators)
+var float haClose = na
+var float haOpen  = na
+
+haClose := (open + high + low + close) / 4.0
+haOpen  := na(haOpen[1]) ? (open + close) / 2.0 : (nz(haOpen[1]) + nz(haClose[1])) / 2.0
+haHigh  = math.max(high, math.max(haOpen, haClose))
+haLow   = math.min(low,  math.min(haOpen, haClose))
+
+// Previous bar's HA values
+haLowPrev  = haLow[1]
+haHighPrev = haHigh[1]
+
+// ─── ATR Calculations ──────────────────────────────────────────────
+atrEntry = ta.atr(ATREntryLen)
+atrStop  = ta.atr(ATRStopLen)
+atrTrail = ta.atr(ATRTrailLen)
+
+// Previous bar's ATR for entry (ATR[1] in pseudo code)
+atrEntryPrev = atrEntry[1]
+
+// ─── Entry Price Levels ────────────────────────────────────────────
+// Long: HeikenAshiLow[1] + (PriceEntryMult * ATR(30)[1]) → Stop order (price above)
+longEntryPrice  = haLowPrev + (PriceEntryMult * atrEntryPrev)
+
+// Short: HeikenAshiHigh[1] - (PriceEntryMult * ATR(30)[1]) → Stop order (price below)
+shortEntryPrice = haHighPrev - (PriceEntryMult * atrEntryPrev)
+
+// ─── Stop Loss & Trailing Stop Levels ──────────────────────────────
+longSL     = longEntryPrice  - (StopLossCoef * atrStop)
+shortSL    = shortEntryPrice + (StopLossCoef * atrStop)
+
+longTrail  = longEntryPrice  - (TrailingStopCoef * atrTrail)
+shortTrail = shortEntryPrice + (TrailingStopCoef * atrTrail)
+
+// ─── Position Simulation ──────────────────────────────────────────
+// Track pending orders and simulated position state
+var int   posDirection      = 0     // 0=flat, 1=long, -1=short
+var float posEntryPrice     = na
+var float posSL             = na
+var float posTrailingStop   = na
+var int   posBarsInTrade    = 0
+var int   pendingDir        = 0     // 0=none, 1=long pending, -1=short pending
+var float pendingPrice      = na
+var float pendingSL         = na
+var float pendingTrail      = na
+var int   pendingBarsLeft   = 0
+
+// Track signals for plotting
+var bool  entryLongTriggered  = false
+var bool  entryShortTriggered = false
+var bool  exitTriggered       = false
+
+entryLongTriggered  := false
+entryShortTriggered := false
+exitTriggered       := false
+
+// ─── Process exits first ───────────────────────────────────────────
+if posDirection != 0
+    posBarsInTrade += 1
+
+    // Exit after N bars
+    if posBarsInTrade >= ExitAfterBars
+        posDirection    := 0
+        posEntryPrice   := na
+        posSL           := na
+        posTrailingStop := na
+        posBarsInTrade  := 0
+        exitTriggered   := true
+
+    // Stop Loss check
+    else if posDirection == 1 and low <= posSL
+        posDirection    := 0
+        posEntryPrice   := na
+        posSL           := na
+        posTrailingStop := na
+        posBarsInTrade  := 0
+        exitTriggered   := true
+
+    else if posDirection == -1 and high >= posSL
+        posDirection    := 0
+        posEntryPrice   := na
+        posSL           := na
+        posTrailingStop := na
+        posBarsInTrade  := 0
+        exitTriggered   := true
+
+    // Trailing Stop check
+    else if posDirection == 1
+        // Update trailing stop upward
+        newTrail = close - (TrailingStopCoef * atrTrail)
+        if newTrail > posTrailingStop
+            posTrailingStop := newTrail
+        if low <= posTrailingStop
+            posDirection    := 0
+            posEntryPrice   := na
+            posSL           := na
+            posTrailingStop := na
+            posBarsInTrade  := 0
+            exitTriggered   := true
+
+    else if posDirection == -1
+        // Update trailing stop downward
+        newTrail = close + (TrailingStopCoef * atrTrail)
+        if newTrail < posTrailingStop
+            posTrailingStop := newTrail
+        if high >= posTrailingStop
+            posDirection    := 0
+            posEntryPrice   := na
+            posSL           := na
+            posTrailingStop := na
+            posBarsInTrade  := 0
+            exitTriggered   := true
+
+// ─── Check pending order fill ──────────────────────────────────────
+if pendingDir != 0 and posDirection == 0
+    pendingBarsLeft -= 1
+    if pendingBarsLeft <= 0
+        // Order expired
+        pendingDir   := 0
+        pendingPrice := na
+        pendingSL    := na
+        pendingTrail := na
+    else
+        // Check if stop order is triggered
+        if pendingDir == 1 and high >= pendingPrice
+            posDirection    := 1
+            posEntryPrice   := pendingPrice
+            posSL           := pendingSL
+            posTrailingStop := pendingTrail
+            posBarsInTrade  := 0
+            pendingDir      := 0
+            pendingPrice    := na
+            entryLongTriggered := true
+
+        else if pendingDir == -1 and low <= pendingPrice
+            posDirection    := -1
+            posEntryPrice   := pendingPrice
+            posSL           := pendingSL
+            posTrailingStop := pendingTrail
+            posBarsInTrade  := 0
+            pendingDir      := 0
+            pendingPrice    := na
+            entryShortTriggered := true
+
+// ─── Place new pending orders ──────────────────────────────────────
+if LongEntrySignal and posDirection != 1
+    // Replace existing pending or place new
+    pendingDir      := 1
+    pendingPrice    := longEntryPrice
+    pendingSL       := longSL
+    pendingTrail    := longEntryPrice - (TrailingStopCoef * atrTrail)
+    pendingBarsLeft := OrderValidBars
+
+else if ShortEntryFiltered and posDirection != -1
+    pendingDir      := 1 // used as flag
+    pendingDir      := -1
+    pendingPrice    := shortEntryPrice
+    pendingSL       := shortSL
+    pendingTrail    := shortEntryPrice + (TrailingStopCoef * atrTrail)
+    pendingBarsLeft := OrderValidBars
+
+// ─── Plotting ──────────────────────────────────────────────────────
+
+// Entry level lines
+plot(showEntryLevels and LongEntrySignal ? longEntryPrice : na,
+     "Long Entry Level", color=color.new(color.green, 30), style=plot.style_circles, linewidth=2)
+plot(showEntryLevels and ShortEntryFiltered ? shortEntryPrice : na,
+     "Short Entry Level", color=color.new(color.red, 30), style=plot.style_circles, linewidth=2)
+
+// Stop Loss levels
+plot(showSLLevels and LongEntrySignal ? longSL : na,
+     "Long SL", color=color.new(color.orange, 40), style=plot.style_cross, linewidth=1)
+plot(showSLLevels and ShortEntryFiltered ? shortSL : na,
+     "Short SL", color=color.new(color.orange, 40), style=plot.style_cross, linewidth=1)
+
+// Trailing Stop levels
+plot(showTrailLevels and LongEntrySignal ? longEntryPrice - (TrailingStopCoef * atrTrail) : na,
+     "Long Trail", color=color.new(color.purple, 40), style=plot.style_cross, linewidth=1)
+plot(showTrailLevels and ShortEntryFiltered ? shortEntryPrice + (TrailingStopCoef * atrTrail) : na,
+     "Short Trail", color=color.new(color.purple, 40), style=plot.style_cross, linewidth=1)
+
+// Active position Stop Loss & Trailing Stop
+plot(posDirection == 1 ? posSL : na,
+     "Active Long SL", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(posDirection == -1 ? posSL : na,
+     "Active Short SL", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(posDirection != 0 ? posTrailingStop : na,
+     "Active Trailing Stop", color=color.purple, style=plot.style_linebr, linewidth=1)
+
+// Signal background
+bgcolor(showSignalBG and LongEntrySignal ? color.new(color.green, 92) : na, title="Long Bias BG")
+bgcolor(showSignalBG and ShortEntryFiltered ? color.new(color.red, 92) : na, title="Short Bias BG")
+
+// Entry & Exit markers
+plotshape(entryLongTriggered, "Long Entry", shape.triangleup,
+          location.belowbar, color.green, size=size.small)
+plotshape(entryShortTriggered, "Short Entry", shape.triangledown,
+          location.abovebar, color.red, size=size.small)
+plotshape(exitTriggered and posDirection == 0, "Exit", shape.xcross,
+          location.belowbar, color.gray, size=size.tiny)
+
+// ─── Info Table ────────────────────────────────────────────────────
+var table infoTable = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "MACD(" + str.tostring(MACDMainFast) + "," + str.tostring(MACDMainSlow) + "," + str.tostring(MACDMainSmooth) + ")",
+               text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, str.tostring(macdLine, "#.##"),
+               text_color=macdLine > 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(infoTable, 0, 1, "Bias", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, LongEntrySignal ? "LONG" : ShortEntryFiltered ? "SHORT" : "NEUTRAL",
+               text_color=LongEntrySignal ? color.green : ShortEntryFiltered ? color.red : color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 2, "Entry Level", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, LongEntrySignal ? str.tostring(longEntryPrice, "#.##") :
+               ShortEntryFiltered ? str.tostring(shortEntryPrice, "#.##") : "—",
+               text_color=color.yellow, text_size=size.small)
+
+    table.cell(infoTable, 0, 3, "Stop Loss", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, LongEntrySignal ? str.tostring(longSL, "#.##") :
+               ShortEntryFiltered ? str.tostring(shortSL, "#.##") : "—",
+               text_color=color.orange, text_size=size.small)
+
+    table.cell(infoTable, 0, 4, "Position", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, posDirection == 1 ? "LONG" : posDirection == -1 ? "SHORT" : "FLAT",
+               text_color=posDirection == 1 ? color.green : posDirection == -1 ? color.red : color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 5, "Bars in Trade", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 5, posDirection != 0 ? str.tostring(posBarsInTrade) + "/" + str.tostring(ExitAfterBars) : "—",
+               text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 6, "ATR(30)", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 6, str.tostring(atrEntry, "#.##"), text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 7, "HA Low/High[1]", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 7, str.tostring(haLowPrev, "#.##") + " / " + str.tostring(haHighPrev, "#.##"),
+               text_color=color.white, text_size=size.small)
+
+// ─── Alerts ────────────────────────────────────────────────────────
+alertcondition(LongEntrySignal and not LongEntrySignal[1],
+               "Long Bias Activated", "MACD turned positive — Long bias active. Entry level: {{plot(\"Long Entry Level\")}}")
+alertcondition(ShortEntryFiltered and not ShortEntryFiltered[1],
+               "Short Bias Activated", "MACD turned negative — Short bias active. Entry level: {{plot(\"Short Entry Level\")}}")
+alertcondition(entryLongTriggered,
+               "Long Entry Triggered", "Long stop order filled!")
+alertcondition(entryShortTriggered,
+               "Short Entry Triggered", "Short stop order filled!")
+alertcondition(exitTriggered,
+               "Position Exited", "Position closed (SL/Trail/Time exit)")

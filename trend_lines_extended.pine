@@ -1,0 +1,222 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © LonesomeTheBlue (original) - Rewritten to accumulate and extend ALL trend lines
+
+//@version=5
+indicator("Trend Lines Extended - All", overlay=true, max_lines_count=500, max_bars_back=5000)
+
+// ─── Inputs ───
+prd       = input.int(defval=20, title="Pivot Period", minval=5, maxval=50)
+maxPivots = input.int(defval=15, title="Max Pivot Points to track", minval=3, maxval=30)
+utcol     = input.color(defval=color.lime, title="Support Color", inline="tcol")
+dtcol     = input.color(defval=color.red, title="Resistance Color", inline="tcol")
+lineWidth = input.int(defval=1, title="Line Width", minval=1, maxval=4)
+respWidth = input.int(defval=2, title="Respected Line Width", minval=1, maxval=4)
+removeBroken    = input.bool(defval=false, title="Remove Broken Lines")
+onlyRespected   = input.bool(defval=false, title="Only Extend Respected Lines")
+hideNonResp     = input.bool(defval=false, title="Hide Non-Respected Lines (when filter ON)")
+touchATRMult    = input.float(defval=0.5, title="Touch Tolerance (ATR multiplier)", minval=0.1, maxval=3.0, step=0.1)
+minRespTouches  = input.int(defval=1, title="Min Touches to Confirm Respected", minval=1, maxval=5)
+
+// ─── Pivot detection ───
+ph = ta.pivothigh(prd, prd)
+pl = ta.pivotlow(prd, prd)
+atrVal = ta.atr(14)
+
+// ─── Arrays to store pivot history ───
+var float[] phVals = array.new_float(0)
+var int[]   phBars = array.new_int(0)
+var float[] plVals = array.new_float(0)
+var int[]   plBars = array.new_int(0)
+
+// ─── Arrays to track resistance lines ───
+var line[]  resistLines      = array.new_line(0)
+var float[] resistSlopes     = array.new_float(0)
+var float[] resistOriginVal  = array.new_float(0)
+var int[]   resistOriginBar  = array.new_int(0)
+var int[]   resistEndBar     = array.new_int(0)
+var int[]   resistTouches    = array.new_int(0)
+var bool[]  resistRespected  = array.new_bool(0)
+
+// ─── Arrays to track support lines ───
+var line[]  supportLines     = array.new_line(0)
+var float[] supportSlopes    = array.new_float(0)
+var float[] supportOriginVal = array.new_float(0)
+var int[]   supportOriginBar = array.new_int(0)
+var int[]   supportEndBar    = array.new_int(0)
+var int[]   supportTouches   = array.new_int(0)
+var bool[]  supportRespected = array.new_bool(0)
+
+// Extension mode for new lines
+lineExt = onlyRespected ? extend.none : extend.right
+
+// ─── New pivot HIGH → check for descending resistance lines ───
+if not na(ph)
+    int   newBar = bar_index - prd
+    float newVal = ph
+
+    if array.size(phVals) > 0
+        for i = 0 to array.size(phVals) - 1
+            float prevVal = array.get(phVals, i)
+            int   prevBar = array.get(phBars, i)
+
+            if newVal < prevVal  // descending → valid resistance
+                float slope = (newVal - prevVal) / (newBar - prevBar)
+                bool  valid = true
+
+                for x = prevBar - prd + 1 to newBar
+                    float lineVal = prevVal + slope * (x - prevBar)
+                    int   offset  = bar_index - x
+                    if offset >= 0 and offset < 5000 and close[offset] > lineVal
+                        valid := false
+                        break
+
+                if valid
+                    line ln = line.new(prevBar, prevVal, newBar, newVal,
+                         color=dtcol, extend=lineExt, width=lineWidth)
+                    array.push(resistLines, ln)
+                    array.push(resistSlopes, slope)
+                    array.push(resistOriginVal, prevVal)
+                    array.push(resistOriginBar, prevBar)
+                    array.push(resistEndBar, newBar)
+                    array.push(resistTouches, 0)
+                    array.push(resistRespected, false)
+
+    array.unshift(phVals, newVal)
+    array.unshift(phBars, newBar)
+    if array.size(phVals) > maxPivots
+        array.pop(phVals)
+        array.pop(phBars)
+
+// ─── New pivot LOW → check for ascending support lines ───
+if not na(pl)
+    int   newBar = bar_index - prd
+    float newVal = pl
+
+    if array.size(plVals) > 0
+        for i = 0 to array.size(plVals) - 1
+            float prevVal = array.get(plVals, i)
+            int   prevBar = array.get(plBars, i)
+
+            if newVal > prevVal  // ascending → valid support
+                float slope = (newVal - prevVal) / (newBar - prevBar)
+                bool  valid = true
+
+                for x = prevBar - prd + 1 to newBar
+                    float lineVal = prevVal + slope * (x - prevBar)
+                    int   offset  = bar_index - x
+                    if offset >= 0 and offset < 5000 and close[offset] < lineVal
+                        valid := false
+                        break
+
+                if valid
+                    line ln = line.new(prevBar, prevVal, newBar, newVal,
+                         color=utcol, extend=lineExt, width=lineWidth)
+                    array.push(supportLines, ln)
+                    array.push(supportSlopes, slope)
+                    array.push(supportOriginVal, prevVal)
+                    array.push(supportOriginBar, prevBar)
+                    array.push(supportEndBar, newBar)
+                    array.push(supportTouches, 0)
+                    array.push(supportRespected, false)
+
+    array.unshift(plVals, newVal)
+    array.unshift(plBars, newBar)
+    if array.size(plVals) > maxPivots
+        array.pop(plVals)
+        array.pop(plBars)
+
+// ─── Check if extended lines are being respected ───
+// A line is "respected" when price approaches it in the extension zone
+// and bounces off (doesn't break through on close)
+float tolerance = atrVal * touchATRMult
+
+// Check resistance lines: respected if high touches line but close stays below
+if array.size(resistLines) > 0
+    for i = 0 to array.size(resistLines) - 1
+        int   endBar  = array.get(resistEndBar, i)
+        // Only check in the extension zone (after the 2nd pivot)
+        if bar_index > endBar
+            float lSlope  = array.get(resistSlopes, i)
+            float lOriVal = array.get(resistOriginVal, i)
+            int   lOriBar = array.get(resistOriginBar, i)
+            float lineVal = lOriVal + lSlope * (bar_index - lOriBar)
+
+            bool alreadyRespected = array.get(resistRespected, i)
+
+            // Touch detection: high reached within tolerance of the line AND close stayed below
+            if not alreadyRespected
+                if high >= lineVal - tolerance and high <= lineVal + tolerance and close <= lineVal
+                    int touches = array.get(resistTouches, i) + 1
+                    array.set(resistTouches, i, touches)
+                    if touches >= minRespTouches
+                        array.set(resistRespected, i, true)
+                        if onlyRespected
+                            line.set_extend(array.get(resistLines, i), extend.right)
+                            line.set_width(array.get(resistLines, i), respWidth)
+
+// Check support lines: respected if low touches line but close stays above
+if array.size(supportLines) > 0
+    for i = 0 to array.size(supportLines) - 1
+        int   endBar  = array.get(supportEndBar, i)
+        // Only check in the extension zone (after the 2nd pivot)
+        if bar_index > endBar
+            float lSlope  = array.get(supportSlopes, i)
+            float lOriVal = array.get(supportOriginVal, i)
+            int   lOriBar = array.get(supportOriginBar, i)
+            float lineVal = lOriVal + lSlope * (bar_index - lOriBar)
+
+            bool alreadyRespected = array.get(supportRespected, i)
+
+            // Touch detection: low reached within tolerance of the line AND close stayed above
+            if not alreadyRespected
+                if low <= lineVal + tolerance and low >= lineVal - tolerance and close >= lineVal
+                    int touches = array.get(supportTouches, i) + 1
+                    array.set(supportTouches, i, touches)
+                    if touches >= minRespTouches
+                        array.set(supportRespected, i, true)
+                        if onlyRespected
+                            line.set_extend(array.get(supportLines, i), extend.right)
+                            line.set_width(array.get(supportLines, i), respWidth)
+
+// ─── Optional: hide non-respected lines when filter is ON ───
+if onlyRespected and hideNonResp and barstate.islast
+    for i = 0 to array.size(resistLines) - 1
+        if not array.get(resistRespected, i)
+            line.set_color(array.get(resistLines, i), color.new(dtcol, 100))
+    for i = 0 to array.size(supportLines) - 1
+        if not array.get(supportRespected, i)
+            line.set_color(array.get(supportLines, i), color.new(utcol, 100))
+
+// ─── Optional: remove lines that price has broken through ───
+if removeBroken
+    if array.size(resistLines) > 0
+        for i = array.size(resistLines) - 1 to 0
+            float lSlope  = array.get(resistSlopes, i)
+            float lOriVal = array.get(resistOriginVal, i)
+            int   lOriBar = array.get(resistOriginBar, i)
+            float lineVal = lOriVal + lSlope * (bar_index - lOriBar)
+            if close > lineVal
+                line.delete(array.get(resistLines, i))
+                array.remove(resistLines, i)
+                array.remove(resistSlopes, i)
+                array.remove(resistOriginVal, i)
+                array.remove(resistOriginBar, i)
+                array.remove(resistEndBar, i)
+                array.remove(resistTouches, i)
+                array.remove(resistRespected, i)
+
+    if array.size(supportLines) > 0
+        for i = array.size(supportLines) - 1 to 0
+            float lSlope  = array.get(supportSlopes, i)
+            float lOriVal = array.get(supportOriginVal, i)
+            int   lOriBar = array.get(supportOriginBar, i)
+            float lineVal = lOriVal + lSlope * (bar_index - lOriBar)
+            if close < lineVal
+                line.delete(array.get(supportLines, i))
+                array.remove(supportLines, i)
+                array.remove(supportSlopes, i)
+                array.remove(supportOriginVal, i)
+                array.remove(supportOriginBar, i)
+                array.remove(supportEndBar, i)
+                array.remove(supportTouches, i)
+                array.remove(supportRespected, i)

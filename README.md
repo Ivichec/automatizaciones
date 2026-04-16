@@ -220,3 +220,87 @@ Sin API key, el script intentara scraping como fallback (puede devolver 403).
 - Fotocasa usa Next.js, los datos se extraen del JSON que el servidor inyecta en el HTML.
 - Tecnocasa y Redpiso tienen inventario limitado a sus propias franquicias/agencias.
 - Usa la opcion `--json` para procesar los resultados con otras herramientas (jq, scripts, etc.).
+
+---
+
+## setup_acceso_remoto.sh
+
+Script interactivo para configurar acceso remoto seguro a un equipo Linux. Ideal para acceder a tu mini PC desde fuera de casa sin riesgos.
+
+### Dos metodos disponibles
+
+| Metodo | Puertos abiertos | Dificultad | Seguridad |
+|--------|-------------------|------------|-----------|
+| **Tailscale** (recomendado) | Ninguno | Muy facil | Muy alta (WireGuard) |
+| **SSH hardened** | 1 puerto (2222) | Media | Alta (multi-capa) |
+
+### Requisitos
+
+- Linux (Debian/Ubuntu, Fedora, Arch)
+- Permisos de root (`sudo`)
+- Conexion a internet
+
+### Instalacion
+
+```bash
+chmod +x setup_acceso_remoto.sh
+```
+
+### Uso
+
+```bash
+# Menu interactivo (recomendado)
+sudo ./setup_acceso_remoto.sh
+
+# O directamente con flags
+sudo ./setup_acceso_remoto.sh --tailscale    # Solo Tailscale
+sudo ./setup_acceso_remoto.sh --ssh          # Solo SSH hardened
+sudo ./setup_acceso_remoto.sh --ambos        # Los dos metodos
+sudo ./setup_acceso_remoto.sh --desinstalar  # Revertir cambios
+```
+
+### Opcion 1: Tailscale (recomendado)
+
+Tailscale crea una VPN mesh gratuita usando WireGuard. No necesitas abrir puertos en el router ni saber tu IP publica.
+
+**Que hace el script:**
+1. Instala Tailscale
+2. Instala OpenSSH server si no existe
+3. Te indica como vincular el equipo a tu cuenta
+
+**Despues de ejecutar el script:**
+```bash
+# En el mini PC — vincular a tu cuenta
+sudo tailscale up --ssh
+
+# En el portatil (instala Tailscale tambien)
+tailscale status                      # Ver dispositivos
+ssh tu_usuario@nombre-minipc          # Conectar
+```
+
+### Opcion 2: SSH hardened
+
+Expone el puerto SSH pero con multiples capas de proteccion:
+
+- **Puerto no estandar** (2222 en vez de 22) — evita el 99% de bots
+- **Solo claves Ed25519** — passwords completamente deshabilitados
+- **fail2ban** — 3 intentos fallidos = ban 1 hora
+- **UFW firewall** — solo el puerto SSH abierto, con rate limiting
+- **Root login deshabilitado**
+- **Timeout de inactividad** — 10 minutos
+
+**Despues de ejecutar el script:**
+1. Copia la clave privada a tu portatil (el script te muestra como)
+2. En el router: redirige el puerto 2222 externo al 2222 interno
+3. Averigua tu IP publica: `curl ifconfig.me`
+4. Desde el portatil:
+```bash
+ssh -i ~/.ssh/minipc_key -p 2222 tu_usuario@TU_IP_PUBLICA
+```
+
+### Recomendaciones para el viaje
+
+- **Prueba la conexion antes de irte** — conecta desde el movil (datos 4G/5G) para simular estar fuera
+- **DNS dinamico** — si tu IP publica cambia, usa un servicio como DuckDNS o No-IP
+- **Tailscale en el movil** — instala la app de Tailscale en el movil como plan B
+- **Notificaciones** — configura un cron que te avise si el equipo se reinicia

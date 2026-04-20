@@ -136,7 +136,7 @@ else if ShortEntryFiltered and posDirection != -1
 // ─── Plotting ──────────────────────────────────────────────────────
 
 // LWMA line
-plot(showLWMA ? lwmaValue : na, "LWMA(" + str.tostring(LWMAPeriod) + ")",
+plot(showLWMA ? lwmaValue : na, "LWMA",
      color=lwmaValue > close ? color.new(color.red, 20) : color.new(color.green, 20), linewidth=2)
 
 // Entry level dots

@@ -1,0 +1,216 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Based on StrategyQuant X Build 143 pseudo code - Strategy 6.10.20(1)
+// Converted to PineScript indicator with visual signals and levels
+
+//@version=6
+indicator("SQ LWMA ATR Strategy", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ─── Strategy Parameters ───────────────────────────────────────────
+LWMAPeriod      = input.int(30,   "LWMA Period",               minval=1)
+PriceEntryMult  = input.float(1.8,"Entry ATR Multiplier",      step=0.1)
+ExitAfterBars   = input.int(25,   "Exit After N Bars",         minval=1)
+StopLossCoef    = input.float(1.2,"Stop Loss ATR Multiplier",  step=0.1)
+ATREntryLen     = input.int(30,   "ATR Length (Entry)",        minval=1)
+ATRStopLen      = input.int(70,   "ATR Length (Stop Loss)",    minval=1)
+OrderValidBars  = input.int(71,   "Order Valid For N Bars",    minval=1)
+
+// ─── Visual Options ────────────────────────────────────────────────
+showEntryLevels = input.bool(true, "Show Entry Levels",        group="Display")
+showSLLevels    = input.bool(true, "Show Stop Loss Levels",    group="Display")
+showLWMA        = input.bool(true, "Show LWMA Line",           group="Display")
+showSignalBG    = input.bool(true, "Show Signal Background",   group="Display")
+
+// ─── LWMA Calculation ──────────────────────────────────────────────
+lwmaValue = ta.wma(close, LWMAPeriod)
+lwmaPrev  = lwmaValue[1]
+
+// Long: LWMA[1] <= Low[1] → media por debajo del mínimo = fuerza alcista
+LongEntrySignal  = lwmaPrev <= low[1]
+
+// Short: LWMA[1] >= High[1] → media por encima del máximo = fuerza bajista
+ShortEntrySignal = lwmaPrev >= high[1]
+
+// Short solo si no hay señal Long (as per pseudo code)
+ShortEntryFiltered = ShortEntrySignal and not LongEntrySignal
+
+// ─── ATR Calculations ──────────────────────────────────────────────
+atrEntry = ta.atr(ATREntryLen)
+atrStop  = ta.atr(ATRStopLen)
+
+atrEntryPrev = atrEntry[1]
+
+// ─── Entry Price Levels ────────────────────────────────────────────
+// Long: Bid + (PriceEntryMult * ATR(30)[1]) → Stop order above current price
+// In PineScript, close approximates Bid for the purpose of level calculation
+longEntryPrice  = close + (PriceEntryMult * atrEntryPrev)
+
+// Short: Ask - (PriceEntryMult * ATR(30)[1]) → Stop order below current price
+shortEntryPrice = close - (PriceEntryMult * atrEntryPrev)
+
+// ─── Stop Loss Levels ──────────────────────────────────────────────
+longSL  = longEntryPrice  - (StopLossCoef * atrStop)
+shortSL = shortEntryPrice + (StopLossCoef * atrStop)
+
+// ─── Position Simulation ──────────────────────────────────────────
+var int   posDirection      = 0
+var float posEntryPrice     = na
+var float posSL             = na
+var int   posBarsInTrade    = 0
+var int   pendingDir        = 0
+var float pendingPrice      = na
+var float pendingSL         = na
+var int   pendingBarsLeft   = 0
+
+var bool  entryLongTriggered  = false
+var bool  entryShortTriggered = false
+var bool  exitTriggered       = false
+
+entryLongTriggered  := false
+entryShortTriggered := false
+exitTriggered       := false
+
+// ─── Process exits first ───────────────────────────────────────────
+if posDirection != 0
+    posBarsInTrade += 1
+
+    if posBarsInTrade >= ExitAfterBars
+        posDirection    := 0
+        posEntryPrice   := na
+        posSL           := na
+        posBarsInTrade  := 0
+        exitTriggered   := true
+
+    else if posDirection == 1 and low <= posSL
+        posDirection    := 0
+        posEntryPrice   := na
+        posSL           := na
+        posBarsInTrade  := 0
+        exitTriggered   := true
+
+    else if posDirection == -1 and high >= posSL
+        posDirection    := 0
+        posEntryPrice   := na
+        posSL           := na
+        posBarsInTrade  := 0
+        exitTriggered   := true
+
+// ─── Check pending order fill ──────────────────────────────────────
+if pendingDir != 0 and posDirection == 0
+    pendingBarsLeft -= 1
+    if pendingBarsLeft <= 0
+        pendingDir   := 0
+        pendingPrice := na
+        pendingSL    := na
+    else
+        if pendingDir == 1 and high >= pendingPrice
+            posDirection    := 1
+            posEntryPrice   := pendingPrice
+            posSL           := pendingSL
+            posBarsInTrade  := 0
+            pendingDir      := 0
+            pendingPrice    := na
+            entryLongTriggered := true
+
+        else if pendingDir == -1 and low <= pendingPrice
+            posDirection    := -1
+            posEntryPrice   := pendingPrice
+            posSL           := pendingSL
+            posBarsInTrade  := 0
+            pendingDir      := 0
+            pendingPrice    := na
+            entryShortTriggered := true
+
+// ─── Place new pending orders ──────────────────────────────────────
+if LongEntrySignal and posDirection != 1
+    pendingDir      := 1
+    pendingPrice    := longEntryPrice
+    pendingSL       := longSL
+    pendingBarsLeft := OrderValidBars
+
+else if ShortEntryFiltered and posDirection != -1
+    pendingDir      := -1
+    pendingPrice    := shortEntryPrice
+    pendingSL       := shortSL
+    pendingBarsLeft := OrderValidBars
+
+// ─── Plotting ──────────────────────────────────────────────────────
+
+// LWMA line
+plot(showLWMA ? lwmaValue : na, "LWMA(" + str.tostring(LWMAPeriod) + ")",
+     color=lwmaValue > close ? color.new(color.red, 20) : color.new(color.green, 20), linewidth=2)
+
+// Entry level dots
+plot(showEntryLevels and LongEntrySignal ? longEntryPrice : na,
+     "Long Entry Level", color=color.new(color.green, 30), style=plot.style_circles, linewidth=2)
+plot(showEntryLevels and ShortEntryFiltered ? shortEntryPrice : na,
+     "Short Entry Level", color=color.new(color.red, 30), style=plot.style_circles, linewidth=2)
+
+// Stop Loss levels
+plot(showSLLevels and LongEntrySignal ? longSL : na,
+     "Long SL", color=color.new(color.orange, 40), style=plot.style_cross, linewidth=1)
+plot(showSLLevels and ShortEntryFiltered ? shortSL : na,
+     "Short SL", color=color.new(color.orange, 40), style=plot.style_cross, linewidth=1)
+
+// Active position Stop Loss
+plot(posDirection != 0 ? posSL : na,
+     "Active SL", color=color.red, style=plot.style_linebr, linewidth=1)
+
+// Signal background
+bgcolor(showSignalBG and LongEntrySignal ? color.new(color.green, 92) : na, title="Long Bias BG")
+bgcolor(showSignalBG and ShortEntryFiltered ? color.new(color.red, 92) : na, title="Short Bias BG")
+
+// Entry & Exit markers
+plotshape(entryLongTriggered, "Long Entry", shape.triangleup,
+          location.belowbar, color.green, size=size.small)
+plotshape(entryShortTriggered, "Short Entry", shape.triangledown,
+          location.abovebar, color.red, size=size.small)
+plotshape(exitTriggered and posDirection == 0, "Exit", shape.xcross,
+          location.belowbar, color.gray, size=size.tiny)
+
+// ─── Info Table ────────────────────────────────────────────────────
+var table infoTable = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "LWMA(" + str.tostring(LWMAPeriod) + ")",
+               text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, str.tostring(lwmaValue, "#.##"),
+               text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 1, "Bias", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, LongEntrySignal ? "LONG" : ShortEntryFiltered ? "SHORT" : "NEUTRAL",
+               text_color=LongEntrySignal ? color.green : ShortEntryFiltered ? color.red : color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 2, "Signal", text_color=color.white, text_size=size.small)
+    signalText = LongEntrySignal ? "LWMA <= Low" : ShortEntryFiltered ? "LWMA >= High" : "—"
+    table.cell(infoTable, 1, 2, signalText,
+               text_color=color.yellow, text_size=size.small)
+
+    table.cell(infoTable, 0, 3, "Entry Level", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, LongEntrySignal ? str.tostring(longEntryPrice, "#.##") :
+               ShortEntryFiltered ? str.tostring(shortEntryPrice, "#.##") : "—",
+               text_color=color.yellow, text_size=size.small)
+
+    table.cell(infoTable, 0, 4, "Stop Loss", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 4, LongEntrySignal ? str.tostring(longSL, "#.##") :
+               ShortEntryFiltered ? str.tostring(shortSL, "#.##") : "—",
+               text_color=color.orange, text_size=size.small)
+
+    table.cell(infoTable, 0, 5, "Position", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 5, posDirection == 1 ? "LONG" : posDirection == -1 ? "SHORT" : "FLAT",
+               text_color=posDirection == 1 ? color.green : posDirection == -1 ? color.red : color.gray, text_size=size.small)
+
+    table.cell(infoTable, 0, 6, "Bars in Trade", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 6, posDirection != 0 ? str.tostring(posBarsInTrade) + "/" + str.tostring(ExitAfterBars) : "—",
+               text_color=color.white, text_size=size.small)
+
+// ─── Alerts ────────────────────────────────────────────────────────
+alertcondition(LongEntrySignal and not LongEntrySignal[1],
+               "Long Bias Activated", "LWMA below Low — Long bias active")
+alertcondition(ShortEntryFiltered and not ShortEntryFiltered[1],
+               "Short Bias Activated", "LWMA above High — Short bias active")
+alertcondition(entryLongTriggered,
+               "Long Entry Triggered", "Long stop order filled!")
+alertcondition(entryShortTriggered,
+               "Short Entry Triggered", "Short stop order filled!")
+alertcondition(exitTriggered,
+               "Position Exited", "Position closed (SL or Time exit)")
